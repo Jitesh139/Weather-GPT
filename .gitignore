@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+pgdata/
+.pytest_cache/
+*.egg-info/
+.vscode/
+.idea/
+*.db
+run.log
+run.pid.txt

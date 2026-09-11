@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WeatherGPT</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app">
+    <h1>WeatherGPT</h1>
+    <p class="subtitle">Ask a weather question, out loud or typed.</p>
+
+    <div class="input-row">
+      <button id="mic-btn" class="mic-btn" aria-label="Start voice input">🎤</button>
+      <input id="text-input" type="text" placeholder="e.g. will it rain in Bhopal this weekend" />
+      <button id="send-btn">Ask</button>
+    </div>
+
+    <div id="status" class="status" hidden></div>
+    <div id="transcript" class="transcript" hidden></div>
+
+    <div id="answer-card" class="answer-card" hidden>
+      <div class="answer-meta">
+        <span id="answer-path" class="badge"></span>
+        <span id="answer-verified" class="badge"></span>
+      </div>
+      <p id="answer-text"></p>
+    </div>
+
+    <div id="error-banner" class="error-banner" hidden></div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
