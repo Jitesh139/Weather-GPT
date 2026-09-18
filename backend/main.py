@@ -4,9 +4,11 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -22,12 +24,21 @@ from logging_config import (
 )
 from models.schemas import ASRRequest, ASRResponse, FinalAnswer, QueryRequest, TTSRequest, TTSResponse, VoiceConfigResponse
 from router.query_classifier import classify_with_reason
-from services import bhashini_client, fast_path, google_voice_client, weather
+from services import (
+    bhashini_client,
+    fast_path,
+    google_voice_client,
+    language as lang,
+    research,
+    weather,
+)
 from services.bhashini_client import BhashiniConfigError, BhashiniError, TransientBhashiniError
 from services.google_voice_client import GoogleVoiceConfigError, GoogleVoiceError
 from services.generator import run_generator
+from services.regional_narrative import build_regional_narrative
 from services.llm_client import (
     LLMConfigError,
+    LLMResponseTruncated,
     LLMToolLoopExceeded,
     LLMUngroundedClaimError,
     get_generator_client,
@@ -55,10 +66,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# /frontend is where docker-compose volume-mounts the frontend/ folder
-# inside the backend container. FRONTEND_DIR lets a local (non-Docker)
-# run point this at the real frontend/ folder instead.
-_FRONTEND_DIR = Path(os.environ.get("FRONTEND_DIR", "/frontend"))
+# The frontend is a Vite/React app (../frontend) whose production build
+# lands in ../frontend/dist. /frontend is where docker-compose
+# volume-mounts that dist folder inside the backend container; the local
+# (non-Docker) fallback points straight at it on disk, so `uvicorn main:app`
+# serves the built UI on the same origin as the API with no extra config.
+# FRONTEND_DIR overrides both.
+_BACKEND_DIR = Path(__file__).resolve().parent
+_FRONTEND_CANDIDATES = [Path("/frontend"), _BACKEND_DIR.parent / "frontend" / "dist"]
+
+
+def _resolve_frontend_dir() -> Path:
+    override = os.environ.get("FRONTEND_DIR")
+    if override:
+        return Path(override)
+    for candidate in _FRONTEND_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    return _FRONTEND_CANDIDATES[0]
+
+
+_FRONTEND_DIR = _resolve_frontend_dir()
 
 
 @app.get("/health")
@@ -135,10 +163,10 @@ def voice_tts(request: TTSRequest) -> TTSResponse:
 
 
 _WEATHER_FETCH_ERRORS = (WeatherServiceError, TransientWeatherError)
-_LLM_ERRORS = (LLMConfigError, LLMToolLoopExceeded, LLMUngroundedClaimError)
+_LLM_ERRORS = (LLMConfigError, LLMResponseTruncated, LLMToolLoopExceeded, LLMUngroundedClaimError)
 
 
-def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | None]:
+def _run_fast_path(text_query: str, db: Session, language: str = lang.DEFAULT_LANGUAGE) -> tuple[FinalAnswer, int | None]:
     """Returns (FinalAnswer, fetch_latency_ms)."""
     fetch_start = time.monotonic()
     location, parameter = fast_path.extract_location_and_param(text_query)
@@ -149,7 +177,7 @@ def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | Non
                 answer=None,
                 path="fast",
                 verified=False,
-                error="I couldn't identify a location in your question - please specify a city.",
+                error=lang.message("no_location", language),
                 latency_ms=0,
             ),
             None,
@@ -167,13 +195,13 @@ def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | Non
                     answer=None,
                     path="fast",
                     verified=False,
-                    error=f"I couldn't get reliable data right now ({validation.reason}).",
+                    error=lang.message("unreliable_data", language, reason=validation.reason),
                     latency_ms=0,
                 ),
                 fetch_latency_ms,
             )
 
-        answer_text = fast_path.build_answer(forecast, parameter)
+        answer_text = fast_path.build_answer(forecast, parameter, language)
         return (
             FinalAnswer(
                 answer=answer_text,
@@ -192,7 +220,7 @@ def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | Non
                 answer=None,
                 path="fast",
                 verified=False,
-                error=f"I couldn't get reliable weather data right now: {exc}",
+                error=lang.message("fetch_failed", language, error=exc),
                 latency_ms=0,
             ),
             fetch_latency_ms,
@@ -206,7 +234,7 @@ def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | Non
                 answer=None,
                 path="fast",
                 verified=False,
-                error=f"I couldn't get reliable weather data right now: {exc}",
+                error=lang.message("fetch_failed", language, error=exc),
                 latency_ms=0,
             ),
             fetch_latency_ms,
@@ -217,10 +245,15 @@ def _run_fast_path(text_query: str, db: Session) -> tuple[FinalAnswer, int | Non
 def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
     total_start = time.monotonic()
     path, reason = classify_with_reason(request.text)
-    logger.info("Routed query %r -> %s (%s)", request.text, path, reason)
+    # Answer in whatever language the question came in. Non-English
+    # queries match none of the router's English FAST patterns, so they
+    # land on the SLOW path by default and are handled by the generator
+    # prompt rather than by the template table.
+    query_language = lang.detect_language(request.text)
+    logger.info("Routed query %r -> %s (%s), language=%s", request.text, path, reason, query_language)
 
     if path == "fast":
-        result, fetch_ms = _run_fast_path(request.text, db)
+        result, fetch_ms = _run_fast_path(request.text, db, query_language)
         total_ms = int((time.monotonic() - total_start) * 1000)
         result.latency_ms = total_ms
         log_query(
@@ -244,7 +277,7 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
 
     try:
         gen_start = time.monotonic()
-        draft = run_generator(request.text, generator_client, db)
+        draft = run_generator(request.text, generator_client, db, language=query_language)
         gen_ms = int((time.monotonic() - gen_start) * 1000)
 
         verify_start = time.monotonic()
@@ -264,7 +297,11 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
             logger.info("Verification failed (attempt 1): %s - retrying generator once", verification.mismatches)
             gen_start = time.monotonic()
             draft = run_generator(
-                request.text, generator_client, db, mismatch_hint="; ".join(verification.mismatches)
+                request.text,
+                generator_client,
+                db,
+                mismatch_hint="; ".join(verification.mismatches),
+                language=query_language,
             )
             gen_ms += int((time.monotonic() - gen_start) * 1000)
 
@@ -305,7 +342,7 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
         # (spec 5.2: "never surface an unverified answer") using the same
         # query's location extraction, rather than the unverified draft.
         logger.warning("Verification failed twice - falling back to fast-path template")
-        fallback, fetch_ms = _run_fast_path(request.text, db)
+        fallback, fetch_ms = _run_fast_path(request.text, db, query_language)
         total_ms = int((time.monotonic() - total_start) * 1000)
         fallback.path = "slow"
         fallback.latency_ms = total_ms
@@ -329,7 +366,7 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
             answer=None,
             path="slow",
             verified=False,
-            error=f"I couldn't get a reliable, verified answer right now: {exc}",
+            error=lang.message("verify_failed", query_language, error=exc),
             latency_ms=total_ms,
         )
         update_query_log(
@@ -348,7 +385,7 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
             answer=None,
             path="slow",
             verified=False,
-            error=f"I couldn't get reliable weather data right now: {exc}",
+            error=lang.message("fetch_failed", query_language, error=exc),
             latency_ms=total_ms,
         )
         update_query_log(
@@ -372,7 +409,7 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
             answer=None,
             path="slow",
             verified=False,
-            error=f"I couldn't get a reliable, verified answer right now: {exc}",
+            error=lang.message("verify_failed", query_language, error=exc),
             latency_ms=total_ms,
         )
         update_query_log(
@@ -384,6 +421,151 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
             error=result.error,
         )
         return result
+
+
+# ---------------------------------------------------------------------
+# Researcher dashboard (spec: Researcher persona only)
+#
+# Features 1 and 2 are direct data endpoints with no LLM involvement -
+# the statistics are arithmetic, computed in services/research.py, and
+# routing them through a language model would make them slower, costlier
+# and less trustworthy for no gain. Feature 3's optional narrative is the
+# single place this dashboard touches the LLM, and it reuses the core
+# generate-then-verify pipeline rather than a separate path.
+# ---------------------------------------------------------------------
+
+
+@app.get("/research/models")
+def research_models() -> dict:
+    """Catalog for the dashboard's model picker. Every id here was probed
+    against the live API - see services/research.py."""
+    return {
+        "models": research.FORECAST_MODELS,
+        "default": research.DEFAULT_MODELS,
+        "parameters": research.COMPARE_PARAMETERS,
+        "historical_parameters": [
+            {"id": key, "label": spec["label"], "unit": spec["unit"]}
+            for key, spec in research.HISTORICAL_PARAMETERS.items()
+        ],
+    }
+
+
+@app.get("/research/compare-models")
+def research_compare_models(
+    location: str = Query(..., min_length=1),
+    models: Optional[str] = Query(None, description="Comma-separated model ids"),
+    forecast_days: int = Query(3, ge=1, le=14),
+    db: Session = Depends(get_db),
+) -> dict:
+    model_list = [m.strip() for m in models.split(",") if m.strip()] if models else None
+    try:
+        return research.compare_models(db, location, model_list, forecast_days)
+    except research.ResearchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except _WEATHER_FETCH_ERRORS as exc:
+        raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
+
+
+@app.get("/research/historical-trend")
+def research_historical_trend(
+    location: str = Query(..., min_length=1),
+    parameter: str = Query("temperature"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    aggregation: str = Query("monthly", pattern="^(daily|monthly|yearly)$"),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return research.historical_trend(db, location, parameter, start_date, end_date, aggregation)
+    except research.ResearchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except _WEATHER_FETCH_ERRORS as exc:
+        raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
+
+
+@app.get("/research/regional-context")
+def research_regional_context(db: Session = Depends(get_db)) -> dict:
+    """Conditions across the Arabian Sea / Bay of Bengal sampling points
+    next to the Indian coastal cities. Data only - it asserts no link
+    between the two, by design."""
+    try:
+        return research.regional_context(db)
+    except _WEATHER_FETCH_ERRORS as exc:
+        raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
+
+
+@app.get("/research/regional-context/narrative")
+def research_regional_narrative(db: Session = Depends(get_db)) -> dict:
+    """Optional grounded description of the regional panel.
+
+    Separate from /research/regional-context on purpose: the data must
+    render immediately, while this costs two LLM round trips. Same
+    generate-then-verify flow as /query - an unverified draft is never
+    surfaced, exactly as on the conversational path.
+    """
+    total_start = time.monotonic()
+    try:
+        context = research.regional_context(db)
+    except _WEATHER_FETCH_ERRORS as exc:
+        raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
+
+    try:
+        draft, verification = build_regional_narrative(
+            context, get_generator_client(), get_verifier_client()
+        )
+    except _LLM_ERRORS as exc:
+        logger.warning("Regional narrative failed: %s", exc)
+        return {
+            "narrative": None,
+            "verified": False,
+            "error": f"I couldn't produce a verified description right now: {exc}",
+            "latency_ms": int((time.monotonic() - total_start) * 1000),
+        }
+    except Exception as exc:  # noqa: BLE001 - never a raw 500 on this path either
+        logger.exception("Regional narrative failed with an unexpected error")
+        return {
+            "narrative": None,
+            "verified": False,
+            "error": f"I couldn't produce a verified description right now: {exc}",
+            "latency_ms": int((time.monotonic() - total_start) * 1000),
+        }
+
+    total_ms = int((time.monotonic() - total_start) * 1000)
+    if not verification.passed:
+        # Same rule as the conversational path: never surface an
+        # unverified answer. Here there is no template to fall back to, so
+        # the panel simply shows its data without a narrative.
+        return {
+            "narrative": None,
+            "verified": False,
+            "error": "The generated description did not pass verification, so it is not shown.",
+            "mismatches": verification.mismatches,
+            "latency_ms": total_ms,
+        }
+
+    return {
+        "narrative": draft.text,
+        "verified": True,
+        "disclaimer": (
+            "Descriptive context grounded in the fetched data for both regions. "
+            "Not a cyclone forecast or a causal prediction."
+        ),
+        "latency_ms": total_ms,
+    }
+
+
+# The dashboard is a client-side route, so there is no dashboard/ file on
+# disk for StaticFiles to serve. Without this, opening
+# /dashboard/researcher directly - or just refreshing the page while on
+# it - would 404. Registered ahead of the mount, and scoped to the one
+# prefix the SPA owns rather than being a catch-all, so it can't shadow a
+# real asset.
+@app.get("/dashboard/{spa_path:path}", include_in_schema=False)
+def dashboard_spa(spa_path: str):  # noqa: ARG001 - path is handled client-side
+    index = _FRONTEND_DIR / "index.html"
+    if not index.is_file():
+        raise HTTPException(status_code=404, detail="Frontend build not found - run `npm run build`.")
+    return FileResponse(index)
 
 
 # Mounted last, deliberately: a StaticFiles mount at "/" matches every

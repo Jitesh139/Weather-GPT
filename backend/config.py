@@ -3,15 +3,25 @@ from the environment (via .env in local/dev, or real env vars in prod) -
 nothing is ever hardcoded here.
 """
 import logging
+from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
+# The .env lives at the project root, next to docker-compose.yml - one
+# level above this backend/ package. Resolving it absolutely means the
+# app picks up the same config whether it is started from the repo root,
+# from backend/, or from inside the container. A plain ".env" is still
+# honoured as a fallback for a CWD-local override.
+_ROOT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(_ROOT_ENV_FILE, ".env"), env_file_encoding="utf-8", extra="ignore"
+    )
 
     anthropic_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None

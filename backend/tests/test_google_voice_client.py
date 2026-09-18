@@ -83,19 +83,23 @@ class _FakeTranscription:
 
 
 class _FakeServerContent:
-    def __init__(self, text, complete):
+    def __init__(self, text, complete, spoken_text=None):
         self.output_transcription = _FakeTranscription(text)
+        # What the user actually said, in their own language. None here
+        # means the model only sent back the translation.
+        self.input_transcription = _FakeTranscription(spoken_text) if spoken_text else None
         self.turn_complete = complete
 
 
 class _FakeLiveResponse:
-    def __init__(self, text, complete):
-        self.server_content = _FakeServerContent(text, complete)
+    def __init__(self, text, complete, spoken_text=None):
+        self.server_content = _FakeServerContent(text, complete, spoken_text)
 
 
 class _FakeLiveSession:
-    def __init__(self, transcript_text):
+    def __init__(self, transcript_text, spoken_text=None):
         self._transcript_text = transcript_text
+        self._spoken_text = spoken_text
         self.sent_chunks = []
         self.stream_ended = False
 
@@ -106,7 +110,7 @@ class _FakeLiveSession:
             self.stream_ended = True
 
     async def receive(self):
-        yield _FakeLiveResponse(self._transcript_text, True)
+        yield _FakeLiveResponse(self._transcript_text, True, self._spoken_text)
 
 
 class _FakeLiveConnectCM:
@@ -147,6 +151,29 @@ def test_speech_to_text_happy_path(monkeypatch):
     assert transcript == "hello there"
     assert fake_session.stream_ended
     assert len(fake_session.sent_chunks) > 0
+
+
+def test_speech_to_text_returns_what_was_actually_said_not_the_translation(monkeypatch):
+    """Multilingual answers depend on this. The Live model returns both an
+    input transcription (the user's own words) and an English translation;
+    returning the translation threw away the language before /query could
+    detect it, so a Hindi question always came back answered in English.
+    """
+    fake_session = _FakeLiveSession("How is the weather today?", spoken_text="aaj ka mausam kaisa hai")
+    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
+
+    transcript = google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())
+
+    assert transcript == "aaj ka mausam kaisa hai"
+
+
+def test_speech_to_text_falls_back_to_translation_when_no_input_transcription(monkeypatch):
+    fake_session = _FakeLiveSession("How is the weather today?", spoken_text=None)
+    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
+
+    transcript = google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())
+
+    assert transcript == "How is the weather today?"
 
 
 def test_speech_to_text_empty_transcript_raises(monkeypatch):

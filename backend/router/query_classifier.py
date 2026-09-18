@@ -46,6 +46,30 @@ FAST_PATTERNS = [
 ]
 
 
+# Hindi/Hinglish equivalents of the FAST patterns above. Without these,
+# every non-English question fell through to default_to_slow and paid a
+# full two-stage LLM round trip - about ten seconds - for a lookup the
+# template path answers from cache in milliseconds. Matched against both
+# Devanagari and the Latin-script spellings people actually type and that
+# speech-to-text returns.
+FAST_PATTERNS_HI = [
+    re.compile(r"\bmausam\s+(kaisa|kaisi|kesa|kesi|kaise)\b"),
+    re.compile(r"\b(kaisa|kaisi|kesa|kesi)\s+(hai|rahega|rahegi|hoga|h)\b"),
+    re.compile(r"\b(taapman|tapman|temperature)\s+(kitna|kitni|kya)\b"),
+    re.compile(r"\b(barish|baarish|barsat)\s+(hogi|ho\s+rahi|hai)\b"),
+    re.compile(r"\b(garmi|sardi|thand|hawa)\s+(kitni|kitna|kaisi|kaisa)\b"),
+    re.compile(r"मौसम\s+कैस"),
+    re.compile(r"(तापमान|गरमी|गर्मी|बारिश)\s+(कितन|कैस)"),
+]
+
+# Reasoning words, Hindi side. Same rule as SLOW_KEYWORDS: a hit here
+# beats any FAST match.
+SLOW_KEYWORDS_HI = [
+    "kyun", "kyu", "kyon", "chahiye", "salah", "behtar", "tulna", "asar",
+    "क्यों", "चाहिए", "सलाह", "तुलना", "असर",
+]
+
+
 def classify_with_reason(query: str) -> tuple[Path, str]:
     text = query.strip().lower()
 
@@ -53,9 +77,27 @@ def classify_with_reason(query: str) -> tuple[Path, str]:
         if kw in text:
             return "slow", f"slow_keyword:{kw}"
 
+    for kw in SLOW_KEYWORDS_HI:
+        if kw in text:
+            return "slow", f"slow_keyword_hi:{kw}"
+
     for pattern in FAST_PATTERNS:
         if pattern.search(text):
             return "fast", f"fast_pattern:{pattern.pattern}"
+
+    for pattern in FAST_PATTERNS_HI:
+        if pattern.search(text):
+            # Gated on the location actually being extractable, unlike the
+            # English patterns. Hindi word order puts the place name after
+            # a postposition, which the extractor only sometimes finds - and
+            # a wrong FAST route here would answer "please specify a city"
+            # to a question the SLOW path could have handled fine.
+            from services.fast_path import extract_location_and_param
+
+            location, _ = extract_location_and_param(query)
+            if location:
+                return "fast", f"fast_pattern_hi:{pattern.pattern}"
+            return "slow", "hi_pattern_without_location"
 
     return "slow", "default_to_slow"
 

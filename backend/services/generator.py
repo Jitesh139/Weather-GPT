@@ -25,6 +25,12 @@ SYSTEM_PROMPT = (
     "say so plainly instead of guessing a value. Keep the answer conversational and concise, "
     "suitable for being spoken aloud. If the question involves crop/agricultural advice, "
     "explicitly caveat that this is general guidance, not a verified agronomic recommendation."
+    "\n\nLANGUAGE: Write your entire answer in the SAME language and script the user used in "
+    "their question. If they asked in Hindi, answer in Hindi; if they wrote Hindi in Latin "
+    "script ('aaj ka mausam kaisa hai'), answer the same way, in Latin script; if they asked "
+    "in English, answer in English. This applies to any language, not only these. Keep place "
+    "names and the numbers themselves exactly as the tool returned them - translate the "
+    "sentence around them, never the data."
 )
 
 
@@ -70,8 +76,22 @@ def _make_tool_executor(db: Session):
     return tool_executor
 
 
-def run_generator(query: str, llm_client: LLMClient, db: Session, mismatch_hint: str | None = None) -> DraftAnswer:
+def run_generator(
+    query: str,
+    llm_client: LLMClient,
+    db: Session,
+    mismatch_hint: str | None = None,
+    language: str | None = None,
+) -> DraftAnswer:
     system_prompt = SYSTEM_PROMPT
+    # The prompt already tells the model to mirror the user's language;
+    # naming the detected one as well removes the ambiguity on short or
+    # romanized queries, where "same language as the user" is a genuinely
+    # harder call for the model to make than it looks.
+    if language and language != "en":
+        system_prompt += (
+            f"\n\nThe user's question was detected as language code '{language}' - answer in it."
+        )
     if mismatch_hint:
         system_prompt += (
             f"\n\nNOTE: a previous draft of your answer failed verification for this reason: "

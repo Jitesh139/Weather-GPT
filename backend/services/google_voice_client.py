@@ -4,17 +4,24 @@ be available. Both directions authenticate with the same GEMINI_API_KEY
 already used by the LLM pipeline - no separate signup needed.
 
 ASR uses gemini-3.5-live-translate-preview (Gemini's Live API real-time
-audio-to-audio translation model), configured to translate into English so
-the query router - which matches English keywords - always gets a usable
-transcript regardless of what language the user spoke in. This also means
-the "transcript" returned here is Gemini's own translation, not a literal
-transcription, when the user didn't speak English.
+audio-to-audio translation model). It returns both an input transcription
+(what the user actually said, in their own language) and an English
+translation; this module returns the INPUT transcription, so the user's
+language survives all the way to /query and the answer can come back in
+it. The English translation is kept only as a fallback for when the input
+transcription doesn't arrive.
+
+That choice trades away one thing deliberately: a non-English transcript
+matches none of the router's English FAST patterns, so non-English
+questions always take the SLOW path. That is the right trade - the SLOW
+path is where the LLM is, and the LLM is what can answer in the user's
+language at all. The FAST path only has templates for the languages in
+services/language.py.
 
 TTS uses a separate, plain (non-live) Gemini text-to-speech model, since
 the translate model above is audio-in/audio-out only and can't synthesize
-speech from arbitrary text. The reply is therefore always spoken in
-English, regardless of the input language - a real limitation, documented
-in README, not silently hidden.
+speech from arbitrary text. It speaks whatever language the answer text is
+written in, which is now the user's own.
 
 Caveat: this integration is grounded in Google's own Live API and
 speech-generation documentation (ai.google.dev/gemini-api/docs/live-api,
@@ -145,11 +152,18 @@ async def _transcribe_async(client, pcm16_16k: bytes) -> str:
         except asyncio.TimeoutError as exc:
             raise GoogleVoiceError("Timed out waiting for Gemini transcription") from exc
 
-    # The translation output is preferred (it's the point of using this
-    # model), but if it never arrived for some reason, the input
-    # transcription is still a usable transcript when the input was
-    # already in (or close to) the target language.
-    return "".join(output_parts).strip() or "".join(input_parts).strip()
+    # The INPUT transcription is preferred: it is what the user actually
+    # said, in the language they said it in, which is what makes a
+    # multilingual answer possible at all. This used to return the English
+    # translation instead, so a question asked in Hindi reached /query
+    # already translated and came back answered in English - the language
+    # was destroyed before any other component could see it.
+    #
+    # The translation is kept as the fallback for when the input
+    # transcription doesn't arrive. Routing is unaffected: a non-English
+    # transcript matches none of the router's English FAST patterns, so it
+    # defaults to the SLOW path, where the generator handles the language.
+    return "".join(input_parts).strip() or "".join(output_parts).strip()
 
 
 def speech_to_text(audio_base64: str, sampling_rate: int = 16000) -> str:
@@ -178,10 +192,31 @@ def speech_to_text(audio_base64: str, sampling_rate: int = 16000) -> str:
     return transcript
 
 
+def _extract_audio(response) -> Optional[bytes]:
+    """Pulls the audio payload out of a generate_content response.
+
+    Written defensively on purpose. The old one-liner
+    (`response.candidates[0].content.parts[0].inline_data.data`) assumed
+    every link in that chain was populated, and intermittently it isn't -
+    a candidate can come back with no parts, or with a text part ahead of
+    the audio one. When that happened the chain raised "'NoneType' object
+    is not subscriptable", which told nobody anything. Scan for the audio
+    instead, and let the caller report honestly when there is none.
+    """
+    for candidate in response.candidates or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            inline_data = getattr(part, "inline_data", None)
+            data = getattr(inline_data, "data", None)
+            if data:
+                return data
+    return None
+
+
 def text_to_speech(text: str) -> str:
-    """Returns base64-encoded WAV audio for the given text, synthesized in
-    English (see module docstring for why the reply doesn't get
-    translated back into the input language)."""
+    """Returns base64-encoded WAV audio for the given text, spoken in
+    whatever language the text is written in - the answer reaching this
+    point is already in the user's own language (see module docstring)."""
     from google.genai import types
 
     client = _require_client()
@@ -195,9 +230,13 @@ def text_to_speech(text: str) -> str:
                 speech_config={"voice_config": {"prebuilt_voice_config": {"voice_name": _TTS_VOICE}}},
             ),
         )
-        pcm_bytes: Optional[bytes] = response.candidates[0].content.parts[0].inline_data.data
+        pcm_bytes: Optional[bytes] = _extract_audio(response)
     except Exception as exc:  # noqa: BLE001
         raise GoogleVoiceError(f"Gemini TTS failed: {exc}") from exc
+
+    if not pcm_bytes:
+        finish_reason = getattr((response.candidates or [None])[0], "finish_reason", None)
+        raise GoogleVoiceError(f"Gemini TTS returned no audio (finish_reason={finish_reason})")
 
     if not pcm_bytes:
         raise GoogleVoiceError("Gemini TTS returned no audio data")

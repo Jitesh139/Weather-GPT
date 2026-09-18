@@ -42,6 +42,11 @@ class LLMToolLoopExceeded(Exception):
     the allowed tool-call iterations - fail loud, never guess."""
 
 
+class LLMResponseTruncated(Exception):
+    """The model hit max_tokens before finishing its response, so what came
+    back is incomplete (and, for a JSON response, unparseable)."""
+
+
 class LLMUngroundedClaimError(Exception):
     """Raised when the generator produces a numeric claim without ever
     calling the weather tool - the concrete enforcement of spec principle
@@ -49,6 +54,21 @@ class LLMUngroundedClaimError(Exception):
 
 
 ToolExecutor = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+# Deliberately generous. On Claude Opus 5 (the configured verifier)
+# adaptive thinking is on by default and its tokens count against
+# max_tokens, so a tight cap gets spent on reasoning and truncates the
+# actual answer mid-sentence. This bit us for real: the verifier at
+# max_tokens=1024 returned a JSON object cut off at 389 characters, and
+# every slow-path query died on "Unterminated string". Anthropic's own
+# guidance for non-streaming requests is ~16k, which is a ceiling, not a
+# reservation - we're billed for tokens produced, not tokens allowed.
+_ANTHROPIC_MAX_TOKENS = 16000
+
+# Thinking depth for the Stage 2 verifier. See the comment at the call
+# site for why this is low rather than the default. Override per
+# deployment if you'd rather trade latency back for scrutiny.
+_VERIFIER_EFFORT = "low"
 
 _VERIFY_SCHEMA = {
     "type": "object",
@@ -136,11 +156,16 @@ class AnthropicClient(LLMClient):
         for _ in range(max_tool_iterations + 1):
             response = client.messages.create(
                 model=self.model,
-                max_tokens=4096,
+                max_tokens=_ANTHROPIC_MAX_TOKENS,
                 system=system_prompt,
                 tools=anthropic_tools,
                 messages=messages,
             )
+
+            if response.stop_reason == "max_tokens":
+                raise LLMResponseTruncated(
+                    f"Generator response hit the {_ANTHROPIC_MAX_TOKENS}-token cap before finishing"
+                )
 
             if response.stop_reason == "end_turn":
                 draft_text = next((b.text for b in response.content if b.type == "text"), "")
@@ -186,11 +211,36 @@ class AnthropicClient(LLMClient):
 
         response = client.messages.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=_ANTHROPIC_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {"type": "json_schema", "schema": _VERIFY_SCHEMA}},
+            output_config={
+                "format": {"type": "json_schema", "schema": _VERIFY_SCHEMA},
+                # Low effort, deliberately. By the time this runs, every
+                # number has already been checked by the programmatic diff
+                # in verifier.py - all that's left is judging a couple of
+                # qualitative phrases against the source data, which is
+                # exactly the "simple task" case Anthropic recommends low
+                # effort for. At the default (high), Opus 5 was spending
+                # 3-24 seconds thinking about it and dominating total
+                # response time; measured at low it is a fraction of that.
+                "effort": _VERIFIER_EFFORT,
+            },
         )
-        text = next(b.text for b in response.content if b.type == "text")
+
+        # Checked before parsing: a truncated response still arrives as a
+        # 200 with a half-written JSON string, which json.loads reports as
+        # a baffling "Unterminated string" rather than what actually
+        # happened. Fail loud and honestly instead.
+        if response.stop_reason == "max_tokens":
+            raise LLMResponseTruncated(
+                f"Verifier response hit the {_ANTHROPIC_MAX_TOKENS}-token cap before the JSON was complete"
+            )
+
+        text = "".join(b.text for b in response.content if b.type == "text")
+        if not text.strip():
+            raise LLMToolLoopExceeded(
+                f"Verifier returned no text content (stop_reason={response.stop_reason})"
+            )
         data = json.loads(text)
         return VerificationResult(passed=data["passed"], mismatches=data.get("mismatches", []))
 
@@ -280,6 +330,10 @@ class GeminiClient(LLMClient):
                 response_schema=_VERIFY_SCHEMA_GEMINI,
             ),
         )
+        # response.text is None when the candidate was truncated or blocked;
+        # json.loads(None) would raise a TypeError that says nothing useful.
+        if not (response.text or "").strip():
+            raise LLMResponseTruncated("Verifier returned an empty response")
         data = json.loads(response.text)
         return VerificationResult(passed=data["passed"], mismatches=data.get("mismatches", []))
 

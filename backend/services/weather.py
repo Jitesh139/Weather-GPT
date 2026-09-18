@@ -3,6 +3,7 @@ on transient failures and TTL caching backed by Postgres. No API key
 required (spec Section 6).
 """
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
@@ -88,18 +89,11 @@ def geocode(db: Session, location: str) -> GeocodeResult:
     return result
 
 
-def fetch_forecast(db: Session, geo: GeocodeResult) -> WeatherData:
-    """Fetch current + hourly/daily forecast for a resolved location.
-    Cached ~10-15 min (settings.cache_ttl_seconds) per location.
-    """
-    cache_key = f"{geo.latitude:.4f},{geo.longitude:.4f}"
-    cached = cache.get(db, cache_key)
-    if cached is not None:
-        logger.info("forecast cache hit for %s", cache_key)
-        return WeatherData(**cached)
-
-    logger.info("forecast cache miss for %s - calling Open-Meteo", cache_key)
-    data = _get_json(
+def _fetch_forecast_json(geo: GeocodeResult) -> dict[str, Any]:
+    """The bare Open-Meteo call. Split out from fetch_forecast so it can be
+    run on a worker thread without a Session in scope."""
+    logger.info("forecast cache miss for %.4f,%.4f - calling Open-Meteo", geo.latitude, geo.longitude)
+    return _get_json(
         FORECAST_URL,
         {
             "latitude": geo.latitude,
@@ -113,7 +107,9 @@ def fetch_forecast(db: Session, geo: GeocodeResult) -> WeatherData:
         },
     )
 
-    weather = WeatherData(
+
+def _build_weather(geo: GeocodeResult, data: dict[str, Any]) -> WeatherData:
+    return WeatherData(
         location=geo.location_name,
         latitude=geo.latitude,
         longitude=geo.longitude,
@@ -121,6 +117,19 @@ def fetch_forecast(db: Session, geo: GeocodeResult) -> WeatherData:
         hourly=data.get("hourly"),
         daily=data.get("daily"),
     )
+
+
+def fetch_forecast(db: Session, geo: GeocodeResult) -> WeatherData:
+    """Fetch current + hourly/daily forecast for a resolved location.
+    Cached ~10-15 min (settings.cache_ttl_seconds) per location.
+    """
+    cache_key = f"{geo.latitude:.4f},{geo.longitude:.4f}"
+    cached = cache.get(db, cache_key)
+    if cached is not None:
+        logger.info("forecast cache hit for %s", cache_key)
+        return WeatherData(**cached)
+
+    weather = _build_weather(geo, _fetch_forecast_json(geo))
     cache.set(db, cache_key, weather.model_dump(mode="json"), settings.cache_ttl_seconds)
     return weather
 
@@ -157,22 +166,62 @@ def fetch_combined_forecast(db: Session, geo: GeocodeResult) -> WeatherData:
     Google call fails for any reason, this returns exactly what
     fetch_forecast would - Google is a cross-check, never a hard
     dependency for a query to succeed.
-    """
-    forecast = fetch_forecast(db, geo)
 
-    if not settings.google_weather_api_key:
+    The two providers are independent once the location is resolved, so on
+    a cache miss they are fetched concurrently rather than one after the
+    other - this used to be two sequential ~1s round trips on every cold
+    query. Only the HTTP calls run off-thread: the cache reads and writes
+    stay on the calling thread, because the SQLAlchemy Session backing
+    them is not safe to share between threads.
+    """
+    forecast_key = f"{geo.latitude:.4f},{geo.longitude:.4f}"
+    google_key = f"google:{geo.latitude:.4f},{geo.longitude:.4f}"
+
+    cached_forecast = cache.get(db, forecast_key)
+    use_google = bool(settings.google_weather_api_key)
+    cached_google = cache.get(db, google_key) if use_google else None
+
+    fetched_forecast: Optional[dict[str, Any]] = None
+    fetched_google: Optional[dict[str, Any]] = None
+    google_error: Optional[Exception] = None
+
+    need_forecast = cached_forecast is None
+    need_google = use_google and cached_google is None
+
+    if need_forecast and need_google:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            forecast_future = pool.submit(_fetch_forecast_json, geo)
+            google_future = pool.submit(google_weather.fetch_current_conditions, geo.latitude, geo.longitude)
+            fetched_forecast = forecast_future.result()
+            try:
+                fetched_google = google_future.result()
+            except Exception as exc:  # noqa: BLE001 - Google is additive
+                google_error = exc
+    elif need_forecast:
+        fetched_forecast = _fetch_forecast_json(geo)
+    elif need_google:
+        try:
+            fetched_google = google_weather.fetch_current_conditions(geo.latitude, geo.longitude)
+        except Exception as exc:  # noqa: BLE001 - Google is additive
+            google_error = exc
+
+    if cached_forecast is not None:
+        logger.info("forecast cache hit for %s", forecast_key)
+        forecast = WeatherData(**cached_forecast)
+    else:
+        forecast = _build_weather(geo, fetched_forecast or {})
+        cache.set(db, forecast_key, forecast.model_dump(mode="json"), settings.cache_ttl_seconds)
+
+    if google_error is not None:
+        # Never let Google's failure block an otherwise-valid Open-Meteo answer.
+        logger.warning("Google Weather cross-check failed, using Open-Meteo only: %s", google_error)
         return forecast
 
-    cache_key = f"google:{geo.latitude:.4f},{geo.longitude:.4f}"
-    google_current = cache.get(db, cache_key)
+    google_current = cached_google if cached_google is not None else fetched_google
     if google_current is None:
-        try:
-            google_current = google_weather.fetch_current_conditions(geo.latitude, geo.longitude)
-            cache.set(db, cache_key, google_current, settings.cache_ttl_seconds)
-        except Exception as exc:  # noqa: BLE001 - Google is additive; never
-            # let its failure block an otherwise-valid Open-Meteo answer.
-            logger.warning("Google Weather cross-check failed, using Open-Meteo only: %s", exc)
-            return forecast
+        return forecast
+    if cached_google is None:
+        cache.set(db, google_key, google_current, settings.cache_ttl_seconds)
 
     forecast.google = google_current
     forecast.best_estimate = _best_estimate(forecast.current, google_current) or None

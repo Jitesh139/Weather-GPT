@@ -20,6 +20,13 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH}"
 os.environ.setdefault("ANTHROPIC_API_KEY", "")
 os.environ.setdefault("GEMINI_API_KEY", "")
 os.environ.setdefault("GOOGLE_WEATHER_API_KEY", "")
+# Pinned, not merely defaulted-in-code: config.py reads the project-root
+# .env, so without these the suite would assert against whichever
+# provider a developer happens to have configured locally rather than
+# against the documented defaults.
+os.environ["VOICE_PROVIDER"] = "web_speech"
+os.environ["GENERATOR_PROVIDER"] = "claude"
+os.environ["VERIFIER_PROVIDER"] = "gemini"
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

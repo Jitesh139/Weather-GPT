@@ -18,11 +18,26 @@ User (voice or text)
       -> TTS: Web Speech API (browser) OR Bhashini TTS OR Gemini TTS (via backend proxy)
 ```
 
-Voice provider is switchable via `VOICE_PROVIDER` (see below) - the
-frontend queries `GET /voice/config` once at load to decide which flow
-to use. Bhashini/Gemini credentials never reach the browser: `/voice/asr`
-and `/voice/tts` proxy through the backend, which is the only place that
-holds `BHASHINI_USER_ID`/`BHASHINI_API_KEY` or `GEMINI_API_KEY`.
+Voice provider is switchable via `VOICE_PROVIDER` (see below).
+Bhashini/Gemini credentials never reach the browser: `/voice/asr` and
+`/voice/tts` proxy through the backend, which is the only place that holds
+`BHASHINI_USER_ID`/`BHASHINI_API_KEY` or `GEMINI_API_KEY`.
+
+The React frontend calls `GET /voice/config` once at load and picks the
+matching client flow (`frontend/src/lib/voice.ts`):
+
+- `web_speech` - the browser's own SpeechRecognition/speechSynthesis
+  handle both directions. Zero config, zero quota, Chrome/Edge only.
+- `bhashini` / `google` - the browser records mic audio, encodes it as
+  16-bit mono WAV (neither ASR provider accepts the webm/opus a
+  `MediaRecorder` produces) and posts it to `/voice/asr`; the answer is
+  spoken by posting it to `/voice/tts` and playing the returned WAV. One
+  TTS request per answer, not per sentence, since provider quotas are
+  counted per request.
+
+Either way the mic button, recording animation and error card are the
+same UI - only the transport changes. If `/voice/config` is unreachable,
+voice falls back to the browser-native flow rather than going dead.
 
 Every weather answer is grounded in Open-Meteo (the original, required
 source); when `GOOGLE_WEATHER_API_KEY` is also set, the Google Weather API
@@ -34,6 +49,27 @@ Every request logs its routing decision, per-stage latency, cache hit/
 miss, and verification outcome to Postgres (`query_log`,
 `verification_log`, `cached_forecast`, `user_preference`) - not just
 console output - so this data survives a restart.
+
+## Layout
+
+```
+backend/          FastAPI app - router, weather services, LLM pipeline, DB
+frontend/         Vite + React + Tailwind UI (the one you see)
+legacy-frontend/  The original vanilla HTML/JS UI, kept for reference only
+```
+
+The frontend talks to the backend over plain same-origin `fetch` calls to
+`POST /query` (`frontend/src/lib/api.ts`). Nothing else in the UI knows
+the API exists. There are two ways to run that are both same-origin, so
+no CORS setup and no API base URL to configure:
+
+- **Dev**: the Vite dev server proxies `/query`, `/health` and `/voice/*`
+  to `http://127.0.0.1:8000` (`frontend/vite.config.ts`).
+- **Production**: the backend serves the built frontend itself - it mounts
+  `frontend/dist` at `/` (see the bottom of `backend/main.py`).
+
+Set `VITE_API_BASE` at build time only if you deploy the API on a
+different origin.
 
 ## Running it
 
@@ -49,11 +85,41 @@ console output - so this data survives a restart.
    ```
    docker compose up --build
    ```
-   This starts Postgres, waits for it to be healthy, runs Alembic
-   migrations, then starts the backend.
+   This builds the frontend into `frontend/dist`, starts Postgres, waits
+   for it to be healthy, runs Alembic migrations, then starts the backend
+   with that build mounted at `/`.
 
 3. Open **http://localhost:8000/** for the web UI, or
    **http://localhost:8000/docs** for the interactive API docs.
+
+### Running it without Docker (local dev, hot reload)
+
+```
+.\dev.ps1
+```
+
+Opens the backend on **http://localhost:8000** and the Vite dev server on
+**http://localhost:5173** - open the second one. No Docker and no Postgres
+needed: `dev.ps1` defaults `DATABASE_URL` to the SQLite file
+`backend/dev.db` (`.env`'s value points at the Compose Postgres service,
+which only resolves inside the compose network). Export `DATABASE_URL`
+yourself first to use a real Postgres.
+
+The equivalent by hand:
+
+```
+cd backend
+$env:DATABASE_URL = "sqlite:///dev.db"
+..\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8000
+
+cd frontend          # in a second terminal
+npm install
+npm run dev
+```
+
+To serve the real build off the backend alone (single server, no Vite),
+run `npm run build` in `frontend/` and open http://localhost:8000/ - the
+backend picks up `frontend/dist` automatically.
 
 ### Environment variables to fill in (`.env`)
 
@@ -95,8 +161,10 @@ Success: `{"answer": "...", "path": "fast"|"slow", "verified": true, "source_dat
 
 Failure: `{"answer": null, "error": "...", "path": ..., "verified": false, "latency_ms": ...}`
 
-The frontend (`frontend/app.js`) handles the failure shape explicitly -
-it always shows/speaks an honest message, never a silent blank state.
+The frontend handles the failure shape explicitly - `fetchWeatherQuery`
+in `frontend/src/lib/api.ts` rejects on `{answer: null, error}` (and on an
+unreachable backend), so the UI always shows an honest error message,
+never a silent blank state.
 
 ## Verified against the real APIs
 
@@ -147,6 +215,107 @@ regression tests (`tests/test_llm_client_gemini.py`,
    server-side voice-activity detection, and capping the receive loop by
    message count instead of waiting for `turn_complete`.
 
+## Researcher dashboard
+
+Selecting **Researcher** on the persona screen opens `/dashboard/researcher`
+- a distinct route, not another section of the chat page. The
+conversational interface stays one click away ("Ask a question"), and the
+dashboard reuses the same colour tokens, typography and panel treatment as
+the rest of the product.
+
+| Feature | Endpoint | LLM involved |
+|---|---|---|
+| Multi-model forecast comparison | `GET /research/compare-models` | No |
+| Historical climate trend | `GET /research/historical-trend` | No |
+| Regional context (Arabian Sea / Bay of Bengal) | `GET /research/regional-context` | No |
+| Optional regional description | `GET /research/regional-context/narrative` | Yes - generate + verify |
+
+**Multi-model comparison** requests several underlying models from
+Open-Meteo in one call (`models=` - the response suffixes each variable
+with the model id) and plots one line per model on a shared axis, plus the
+widest single-timestep disagreement. Every model id in the catalog was
+probed against the live API; the docs list some names the API rejects
+(`ecmwf_ifs`, `meteo_france_seamless`), so re-probe before adding more.
+
+**Historical trend** queries the Open-Meteo archive (`archive-api`, data
+back to 1940) and aggregates daily observations to monthly or yearly
+buckets server-side, with a rolling average and mean/min/max. Temperature
+averages and precipitation sums - averaging daily rainfall totals would
+understate a month roughly thirtyfold. No LLM touches this: it is
+arithmetic, and arithmetic does not belong in a language model.
+
+**Regional context** samples six open-ocean points across the two seas and
+six coastal cities, concurrently, and shows them side by side with
+sea-level pressure and gusts. It asserts no causal link. The optional
+description is the only LLM call on the dashboard and goes through the
+*same* pipeline as a conversational answer - tool-enforced generation,
+programmatic numeric diff, LLM qualitative check, one retry on failure,
+and no unverified draft is ever displayed. Its prompt explicitly forbids
+causal or predictive claims ("will bring", "is heading towards"); general
+meteorological context is allowed once and must be framed as such.
+
+**Not built:** GNN-based cloud/storm tracking from satellite imagery. The
+dashboard carries a labelled "future research direction" card for it and
+simulates nothing - no placeholder tracks, no synthetic output.
+
+## Performance
+
+Response latency was dominated by the SLOW path's two LLM stages. Measured
+from the `query_log` table, before and after:
+
+| Stage | Before | After |
+|---|---|---|
+| Verification | 3.2-23.8 s | 2.2-10.5 s |
+| Generation | 4.0-15.6 s | 6.4-7.1 s |
+| Simple Hindi lookup, end to end | 16.6 s | **0 ms** (cached) / ~1 s cold |
+
+Three changes did it:
+
+1. **Verifier effort.** The Stage 2 verifier runs Claude Opus 5, where
+   adaptive thinking is on by default. By the time it runs, every number
+   has already been checked by the programmatic diff - all that is left is
+   judging a couple of qualitative phrases. Running it at `effort: "low"`
+   cut it by roughly 2-3x with nothing to scrutinise more deeply.
+2. **Concurrent providers.** Open-Meteo and the Google Weather cross-check
+   are independent once the location resolves, so on a cache miss they now
+   go out together instead of one after the other. Only the HTTP calls run
+   off-thread - the SQLAlchemy Session stays on the request thread.
+3. **Hindi FAST routing.** The router's FAST patterns were English-only, so
+   every Hindi question - including plain lookups - paid a full two-stage
+   LLM round trip. Hindi/Hinglish patterns now route those to the template
+   path, gated on a location actually being extractable so a question the
+   SLOW path could answer never gets "please specify a city" instead.
+
+## Multilingual answers
+
+A question is answered in the language it was asked in. Two mechanisms,
+because the two paths have different capabilities:
+
+- **SLOW path** (LLM): the generator is instructed to reply in the same
+  language *and script* the user wrote in. This needs no translation
+  table and works for any language the model speaks - including Hindi
+  typed or transcribed in Latin script ("aaj ka mausam kaisa hai"), which
+  is how people actually type it.
+- **FAST path** (templates): can only answer in languages it has
+  templates for - currently English and Hindi (`services/fast_path.py`),
+  with English as the fallback for anything else. `services/language.py`
+  picks between them with a Devanagari script check plus a Hinglish
+  keyword list.
+
+Non-English questions match none of the router's English FAST patterns,
+so in practice they take the SLOW path and get a real generated answer
+rather than a template. The FAST templates matter mainly for the
+verification-failed fallback, which must not silently switch the user
+back to English.
+
+Numbers and place names are never translated - only the sentence around
+them - so the verifier's programmatic numeric diff still works unchanged
+on a Hindi draft.
+
+Verified live: "Aaj Ka Mausam kaisa hai Bhopal mein" -> answered in
+Hinglish; "भोपाल में आज मौसम कैसा है" -> answered in Devanagari; English
+questions unchanged. All three verified and grounded.
+
 ## Combined weather sources
 
 When `GOOGLE_WEATHER_API_KEY` is set, `services/weather.fetch_combined_forecast`
@@ -178,21 +347,15 @@ signup needed. This was run live end-to-end during development (unlike
 the Bhashini integration below, which remains unverified):
 
 - **ASR** (`services/google_voice_client.speech_to_text`): uses
-  `gemini-3.5-live-translate-preview` (Gemini's Live API), configured to
-  translate into English regardless of the spoken language, so the
-  keyword-based router always gets a usable transcript. Confirmed live
-  with English input ("The temperature in Chennai is 29 degrees." ->
-  transcribed correctly) and with real Hindi speech synthesized via
-  Gemini TTS ("आज मुंबई में मौसम कैसा है?" -> correctly translated to
-  "What's the weather like in Mumbai today?", which then round-tripped
-  through `/query` to a correct, verified, combined-source answer).
+  `gemini-3.5-live-translate-preview` (Gemini's Live API). The model
+  returns both an input transcription (what was actually said, in the
+  speaker's own language) and an English translation; this returns the
+  **input transcription**, so the user's language survives to `/query`
+  and the answer can come back in it. The translation is the fallback for
+  when the input transcription doesn't arrive.
 - **TTS** (`services/google_voice_client.text_to_speech`): uses Gemini's
-  native (non-live) TTS model, `gemini-3.1-flash-tts-preview`. Always
-  speaks the reply in English, regardless of the input language - the
-  live translate model above is audio-in/audio-out only and can't
-  synthesize speech from arbitrary already-generated answer text, and
-  this build doesn't add a second text-translate step to work around
-  that. A real limitation, not silently hidden.
+  native (non-live) TTS model, `gemini-3.1-flash-tts-preview`. Speaks
+  whatever language the answer text is in, which is the user's own.
 - **Latency**: a single ASR round-trip took ~17-20 seconds live (the
   audio has to be sent at real-time pace, not just uploaded instantly -
   see bug #7 above), and TTS took a few seconds. Both are "preview"-tier

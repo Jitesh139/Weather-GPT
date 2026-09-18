@@ -15,6 +15,18 @@ services:
     ports:
       - "5432:5432"
 
+  # One-shot: builds the Vite/React frontend into ./frontend/dist, which
+  # the backend below then serves at "/". Runs to completion before the
+  # backend starts. Uses its own anonymous volume for node_modules so the
+  # Linux install never clobbers a host (Windows/macOS) node_modules.
+  frontend-build:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: sh -c "npm install --no-audit --no-fund && npm run build"
+
   backend:
     build:
       context: ./backend
@@ -23,10 +35,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      frontend-build:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
     volumes:
-      - ./frontend:/frontend:ro
+      - ./frontend/dist:/frontend:ro
 
 volumes:
   pgdata:
+  frontend_node_modules:
