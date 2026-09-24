@@ -104,35 +104,35 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
   });
 
   return (
-    <section ref={ref} className="w-full min-h-screen flex flex-col items-center justify-center py-32 px-4 z-10">
+    <section ref={ref} className="w-full min-h-[100dvh] flex flex-col items-center justify-center py-16 sm:py-32 px-3 sm:px-4 z-10">
       <div className={`
-        w-full bg-slate-900/60 backdrop-blur-xl p-6 shadow-2xl transition-all duration-700 ease-in-out flex flex-col
-        ${isFullScreen 
-          ? 'fixed inset-0 z-[100] rounded-none border-0' 
-          : 'max-w-2xl rounded-2xl border border-white/10 relative'
+        w-full bg-slate-900/60 backdrop-blur-xl px-4 sm:px-6 shadow-2xl transition-all duration-700 ease-in-out flex flex-col
+        ${isFullScreen
+          ? 'fixed inset-0 z-[100] rounded-none border-0 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))]'
+          : 'max-w-2xl rounded-2xl border border-white/10 relative py-4 sm:py-6'
         }
       `}>
         <div className={isFullScreen ? "max-w-4xl w-full mx-auto flex flex-col h-full flex-1" : "w-full flex flex-col"}>
-          <div className="flex items-center justify-between mb-8 border-b border-white/10 pb-4">
-            <div className="flex items-center space-x-3">
-              <button 
+          <div className="flex items-center justify-between gap-2 mb-4 sm:mb-8 border-b border-white/10 pb-3 sm:pb-4">
+            <div className="flex items-center space-x-2 sm:space-x-3 min-w-0">
+              <button
                 onClick={onBack}
-                className="p-2 -ml-2 rounded-lg text-textMuted hover:text-textPrimary hover:bg-white/5 transition-colors"
+                className="p-2.5 -ml-1.5 sm:-ml-2 rounded-lg text-textMuted hover:text-textPrimary hover:bg-white/5 transition-colors shrink-0"
                 title="Go Back"
               >
                 <ArrowLeft className="w-5 h-5" />
               </button>
-              <h2 className="font-display text-2xl text-textPrimary">Mausam GPT</h2>
+              <h2 className="font-display text-lg sm:text-2xl text-textPrimary truncate">Mausam GPT</h2>
             </div>
           {activePersona && (
-            <span className="text-xs font-mono uppercase tracking-widest text-accent bg-accent/10 px-3 py-1 rounded-full border border-accent/20">
+            <span className="text-[10px] sm:text-xs font-mono uppercase tracking-widest text-accent bg-accent/10 px-2 sm:px-3 py-1 rounded-full border border-accent/20 shrink-0 whitespace-nowrap">
               {activePersona} Lens
             </span>
           )}
         </div>
-        
+
         {/* Chat Log / Response Area */}
-        <div className={`mb-8 flex flex-col justify-end ${isFullScreen ? 'flex-1 overflow-y-auto' : 'min-h-[200px]'}`}>
+        <div className={`mb-4 sm:mb-8 flex flex-col justify-end ${isFullScreen ? 'flex-1 overflow-y-auto' : 'min-h-[160px] sm:min-h-[200px]'}`}>
           {!response && !error && !loading && (
             <div className="text-center text-textMuted font-sans my-auto">
               Awaiting query...
@@ -173,7 +173,7 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
                 <span className="text-textMuted ml-auto">{response.latency_ms}ms</span>
               </div>
               
-              <div className="text-lg font-sans text-textPrimary leading-relaxed">
+              <div className="text-base sm:text-lg font-sans text-textPrimary leading-relaxed">
                 {response.answer}
               </div>
 
@@ -208,15 +208,15 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleQuery(inputText, 'text');
             }}
-            placeholder="Inquire about meteorological conditions..."
-            className="w-full bg-black/30 border border-white/10 rounded-xl py-4 pl-4 pr-24 text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/50 transition-colors font-sans"
+            placeholder="Ask about the weather..."
+            className="w-full bg-black/30 border border-white/10 rounded-xl py-3.5 sm:py-4 pl-4 pr-[5.5rem] sm:pr-24 text-base text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/50 transition-colors font-sans"
             disabled={isRecording || loading}
           />
-          
-          <div className="absolute right-2 flex items-center space-x-1">
+
+          <div className="absolute right-1.5 sm:right-2 flex items-center space-x-1">
             <button
               onClick={toggleRecording}
-              className={`p-2 rounded-lg transition-colors ${isRecording ? 'bg-alertRed/20 text-alertRed' : 'text-textMuted hover:text-textPrimary hover:bg-white/5'}`}
+              className={`p-2.5 rounded-lg transition-colors ${isRecording ? 'bg-alertRed/20 text-alertRed' : 'text-textMuted hover:text-textPrimary hover:bg-white/5'}`}
             >
               {isRecording ? (
                 <div className="flex items-center justify-center space-x-1 h-5 w-5">
@@ -231,7 +231,7 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
             <button
               onClick={() => handleQuery(inputText, 'text')}
               disabled={!inputText.trim() || loading || isRecording}
-              className="p-2 rounded-lg text-textMuted hover:text-accent hover:bg-accent/10 transition-colors disabled:opacity-50"
+              className="p-2.5 rounded-lg text-textMuted hover:text-accent hover:bg-accent/10 transition-colors disabled:opacity-50"
             >
               <Send className="w-5 h-5" />
             </button>

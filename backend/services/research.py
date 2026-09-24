@@ -141,7 +141,10 @@ def compare_models(
     for spec in COMPARE_PARAMETERS:
         series = []
         for model_id in selected:
-            values = hourly.get(f"{spec['id']}_{model_id}")
+            if len(selected) == 1:
+                values = hourly.get(spec["id"])
+            else:
+                values = hourly.get(f"{spec['id']}_{model_id}")
             if values is None:
                 continue
             series.append(
@@ -408,6 +411,44 @@ def regional_context(db: Session) -> dict[str, Any]:
         "strongest_gust": _strongest_gust(sea),
         "fetched_points": len(fetched),
     }
+    cache.set(db, cache_key, result, settings.cache_ttl_seconds)
+    return result
+
+
+# ---------------------------------------------------------------------
+# Feature 4 - pinned cities for the Live Cloud View map
+# ---------------------------------------------------------------------
+
+# Literal coordinates, like the regional sampling points above - these are
+# map pins, so the marker and the forecast behind it must agree exactly.
+# Geocoding them would risk the two drifting apart.
+MAP_CITIES: list[dict[str, Any]] = [
+    {"id": "bhopal", "name": "Bhopal", "latitude": 23.2599, "longitude": 77.4126},
+    {"id": "indore", "name": "Indore", "latitude": 22.7196, "longitude": 75.8577},
+    {"id": "delhi", "name": "Delhi", "latitude": 28.6139, "longitude": 77.2090},
+    {"id": "mumbai", "name": "Mumbai", "latitude": 19.0760, "longitude": 72.8777},
+    {"id": "chennai", "name": "Chennai", "latitude": 13.0827, "longitude": 80.2707},
+    {"id": "kolkata", "name": "Kolkata", "latitude": 22.5726, "longitude": 88.3639},
+]
+
+
+def map_cities(db: Session) -> dict[str, Any]:
+    """Current conditions for every pinned city in one call.
+
+    Fetched together rather than per marker click: six independent calls
+    are ~6s sequentially but ~1s in parallel, and doing it upfront means
+    opening a popup costs nothing.
+    """
+    cache_key = "research:map-cities"
+    cached = cache.get(db, cache_key)
+    if cached is not None:
+        logger.info("map-cities cache hit")
+        return cached
+
+    with ThreadPoolExecutor(max_workers=len(MAP_CITIES)) as pool:
+        fetched = list(pool.map(_fetch_point, MAP_CITIES))
+
+    result = {"cities": fetched}
     cache.set(db, cache_key, result, settings.cache_ttl_seconds)
     return result
 

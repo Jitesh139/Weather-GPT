@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, MessageSquare, Loader2, AlertCircle, ShieldCheck, FlaskConical } from 'lucide-react';
 import {
   fetchCatalog,
@@ -14,6 +14,7 @@ import {
   type RegionalPoint,
 } from '../../lib/research';
 import { LineChart, Legend, SERIES_COLORS, type Series } from './LineChart';
+import { LiveCloudView } from './LiveCloudView';
 
 interface Props {
   onBackToChat: () => void;
@@ -33,9 +34,9 @@ function Panel({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-white/10 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-xl">
+    <section className="rounded-2xl border border-white/10 bg-slate-900/60 p-4 sm:p-6 shadow-2xl backdrop-blur-xl">
       <header className="mb-5">
-        <h2 className="font-display text-2xl text-textPrimary">{title}</h2>
+        <h2 className="font-display text-xl sm:text-2xl text-textPrimary">{title}</h2>
         {subtitle && <p className="mt-1 font-sans text-sm text-textMuted">{subtitle}</p>}
       </header>
       {children}
@@ -45,7 +46,7 @@ function Panel({
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="flex flex-col gap-1.5">
+    <label className="flex w-full flex-col gap-1.5 sm:w-auto">
       <span className="font-mono text-[10px] uppercase tracking-widest text-textMuted">{label}</span>
       {children}
     </label>
@@ -53,7 +54,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 const inputClass =
-  'rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-sans text-sm text-textPrimary ' +
+  'rounded-lg border border-white/10 bg-black/30 px-3 py-2 font-sans text-base sm:text-sm text-textPrimary ' +
   'placeholder:text-textMuted focus:border-accent/50 focus:outline-none transition-colors';
 
 function ErrorNote({ message }: { message: string }) {
@@ -98,31 +99,45 @@ function ModelComparisonPanel({ catalog }: { catalog: ResearchCatalog }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Toggling a model fires a fetch immediately, so a slow earlier request
+  // must not overwrite a faster later one.
+  const requestId = useRef(0);
+
   const run = async (loc: string, models: string[], forecastDays: number) => {
     if (!models.length) {
+      setData(null);
       setError('Select at least one model to compare.');
       return;
     }
+    const id = ++requestId.current;
     setLoading(true);
     setError(null);
     try {
-      setData(await fetchModelComparison(loc, models, forecastDays));
+      const result = await fetchModelComparison(loc, models, forecastDays);
+      if (id !== requestId.current) return;
+      setData(result);
     } catch (err) {
+      if (id !== requestId.current) return;
       setError((err as Error).message);
       setData(null);
     } finally {
-      setLoading(false);
+      if (id === requestId.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     void run(location, selected, days);
-    // Intentionally on mount only - later runs are triggered by the button.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const toggle = (id: string) =>
-    setSelected((prev) => (prev.includes(id) ? prev.filter((m) => m !== id) : [...prev, id]));
+  // Toggling re-runs against the current location/range. Without this the
+  // pill lights up but the chart keeps showing the previous selection,
+  // which reads as the model being broken.
+  const toggle = (id: string) => {
+    const next = selected.includes(id) ? selected.filter((m) => m !== id) : [...selected, id];
+    setSelected(next);
+    void run(location, next, days);
+  };
 
   // Palette index is the model's position in the full catalog, not in the
   // current selection, so a model keeps its colour as models are toggled.
@@ -136,14 +151,22 @@ function ModelComparisonPanel({ catalog }: { catalog: ResearchCatalog }) {
       <div className="mb-5 flex flex-wrap items-end gap-3">
         <Field label="Location">
           <input
-            className={`${inputClass} w-44`}
+            className={`${inputClass} w-full sm:w-44`}
             value={location}
             onChange={(e) => setLocation(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && run(location, selected, days)}
           />
         </Field>
         <Field label="Forecast days">
-          <select className={`${inputClass} w-28`} value={days} onChange={(e) => setDays(Number(e.target.value))}>
+          <select
+            className={`${inputClass} w-full sm:w-28`}
+            value={days}
+            onChange={(e) => {
+              const next = Number(e.target.value);
+              setDays(next);
+              void run(location, selected, next);
+            }}
+          >
             {[1, 2, 3, 5, 7, 10, 14].map((d) => (
               <option key={d} value={d} className="bg-slate-900">
                 {d} days
@@ -154,7 +177,7 @@ function ModelComparisonPanel({ catalog }: { catalog: ResearchCatalog }) {
         <button
           onClick={() => run(location, selected, days)}
           disabled={loading}
-          className="rounded-lg border border-accent/30 bg-accent/10 px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
+          className="w-full sm:w-auto rounded-lg border border-accent/30 bg-accent/10 px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
         >
           Run comparison
         </button>
@@ -188,11 +211,21 @@ function ModelComparisonPanel({ catalog }: { catalog: ResearchCatalog }) {
       {data && !loading && (
         <div className="space-y-8">
           {data.parameters.map((p) => {
-            const series: Series[] = p.series.map((s) => ({
-              label: s.label,
-              values: s.values,
-              colorIndex: colorFor(s.model),
-            }));
+            // A model that publishes nothing for this parameter would draw
+            // an invisible line while still sitting in the legend, which
+            // reads as a broken model rather than an absent variable. Name
+            // it instead of plotting it.
+            const missing = p.series.filter((s) => s.values.every((v) => v == null));
+            const partial = p.series.filter(
+              (s) => !missing.includes(s) && s.values.some((v) => v == null),
+            );
+            const series: Series[] = p.series
+              .filter((s) => !missing.includes(s))
+              .map((s) => ({
+                label: s.label,
+                values: s.values,
+                colorIndex: colorFor(s.model),
+              }));
             return (
               <div key={p.id}>
                 <div className="mb-2 flex items-baseline justify-between">
@@ -205,13 +238,38 @@ function ModelComparisonPanel({ catalog }: { catalog: ResearchCatalog }) {
                     </span>
                   )}
                 </div>
-                <LineChart
-                  labels={data.time}
-                  series={series}
-                  unit={p.unit}
-                  formatX={(t) => t.slice(5).replace('T', ' ')}
-                />
-                <Legend series={series} />
+                {series.length > 0 ? (
+                  <>
+                    <LineChart
+                      labels={data.time}
+                      series={series}
+                      unit={p.unit}
+                      formatX={(t) => t.slice(5).replace('T', ' ')}
+                    />
+                    <Legend series={series} />
+                  </>
+                ) : (
+                  <p className="py-6 font-mono text-[11px] text-textMuted">
+                    None of the selected models publish {p.label.toLowerCase()}.
+                  </p>
+                )}
+                {missing.length > 0 && (
+                  <p className="pt-2 font-mono text-[11px] text-textMuted">
+                    Not published for this parameter by {missing.map((s) => s.label).join(', ')}.
+                  </p>
+                )}
+                {partial.length > 0 && (
+                  <p className="pt-2 font-mono text-[11px] text-textMuted">
+                    Forecast ends before the selected range for{' '}
+                    {partial
+                      .map((s) => {
+                        const hours = s.values.filter((v) => v != null).length;
+                        return `${s.label} (~${Math.floor(hours / 24)}d)`;
+                      })
+                      .join(', ')}
+                    .
+                  </p>
+                )}
               </div>
             );
           })}
@@ -273,10 +331,10 @@ function HistoricalTrendPanel({ catalog }: { catalog: ResearchCatalog }) {
     >
       <div className="mb-5 flex flex-wrap items-end gap-3">
         <Field label="Location">
-          <input className={`${inputClass} w-40`} value={location} onChange={(e) => setLocation(e.target.value)} />
+          <input className={`${inputClass} w-full sm:w-40`} value={location} onChange={(e) => setLocation(e.target.value)} />
         </Field>
         <Field label="Parameter">
-          <select className={`${inputClass} w-40`} value={parameter} onChange={(e) => setParameter(e.target.value)}>
+          <select className={`${inputClass} w-full sm:w-40`} value={parameter} onChange={(e) => setParameter(e.target.value)}>
             {catalog.historical_parameters.map((p) => (
               <option key={p.id} value={p.id} className="bg-slate-900">
                 {p.label}
@@ -285,13 +343,13 @@ function HistoricalTrendPanel({ catalog }: { catalog: ResearchCatalog }) {
           </select>
         </Field>
         <Field label="From">
-          <input type="date" className={`${inputClass} w-40`} value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+          <input type="date" className={`${inputClass} w-full sm:w-40`} value={startDate} onChange={(e) => setStartDate(e.target.value)} />
         </Field>
         <Field label="To">
-          <input type="date" className={`${inputClass} w-40`} value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+          <input type="date" className={`${inputClass} w-full sm:w-40`} value={endDate} onChange={(e) => setEndDate(e.target.value)} />
         </Field>
         <Field label="Aggregate">
-          <select className={`${inputClass} w-32`} value={aggregation} onChange={(e) => setAggregation(e.target.value)}>
+          <select className={`${inputClass} w-full sm:w-32`} value={aggregation} onChange={(e) => setAggregation(e.target.value)}>
             {['daily', 'monthly', 'yearly'].map((a) => (
               <option key={a} value={a} className="bg-slate-900">
                 {a}
@@ -302,7 +360,7 @@ function HistoricalTrendPanel({ catalog }: { catalog: ResearchCatalog }) {
         <button
           onClick={run}
           disabled={loading}
-          className="rounded-lg border border-accent/30 bg-accent/10 px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
+          className="w-full sm:w-auto rounded-lg border border-accent/30 bg-accent/10 px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20 disabled:opacity-50"
         >
           Load trend
         </button>
@@ -359,22 +417,24 @@ function RegionTable({ title, points }: { title: string; points: RegionalPoint[]
   return (
     <div>
       <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-textMuted">{title}</h3>
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="font-mono text-[10px] uppercase tracking-wider text-textMuted">
-            <th className="pb-1 text-left font-normal">Point</th>
-            <th className="pb-1 text-right font-normal">°C</th>
-            <th className="pb-1 text-right font-normal">Wind</th>
-            <th className="pb-1 text-right font-normal">Gust</th>
-            <th className="pb-1 text-right font-normal">hPa</th>
-          </tr>
-        </thead>
-        <tbody>
-          {points.map((p) => (
-            <PointRow key={p.name} point={p} />
-          ))}
-        </tbody>
-      </table>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[320px] text-xs">
+          <thead>
+            <tr className="font-mono text-[10px] uppercase tracking-wider text-textMuted">
+              <th className="pb-1 text-left font-normal">Point</th>
+              <th className="pb-1 text-right font-normal">°C</th>
+              <th className="pb-1 text-right font-normal">Wind</th>
+              <th className="pb-1 text-right font-normal">Gust</th>
+              <th className="pb-1 text-right font-normal">hPa</th>
+            </tr>
+          </thead>
+          <tbody>
+            {points.map((p) => (
+              <PointRow key={p.name} point={p} />
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -434,7 +494,7 @@ function RegionalContextPanel() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 gap-8 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-6 sm:gap-8 lg:grid-cols-2">
             <div className="space-y-6">
               <RegionTable title="Arabian Sea" points={seaBy('arabian_sea')} />
               <RegionTable title="West coast" points={coastBy('west_coast')} />
@@ -512,33 +572,35 @@ export function ResearcherDashboard({ onBackToChat, onHome }: Props) {
   }, []);
 
   return (
-    <div className="relative z-10 min-h-screen w-full bg-background/80 px-4 py-10 backdrop-blur-sm sm:px-8">
+    <div className="relative z-10 min-h-[100dvh] w-full bg-background/80 px-4 py-6 backdrop-blur-sm sm:px-8 sm:py-10">
       <div className="mx-auto max-w-6xl space-y-6">
-        <header className="flex flex-wrap items-center gap-4 border-b border-white/10 pb-6">
+        <header className="flex flex-wrap items-center gap-3 sm:gap-4 border-b border-white/10 pb-6">
           <button
             onClick={onHome}
-            className="rounded-lg p-2 text-textMuted transition-colors hover:bg-white/5 hover:text-textPrimary"
+            className="rounded-lg p-2.5 text-textMuted transition-colors hover:bg-white/5 hover:text-textPrimary"
             title="Back to home"
           >
             <ArrowLeft className="h-5 w-5" />
           </button>
-          <div>
-            <h1 className="font-display text-3xl text-textPrimary">Researcher Dashboard</h1>
-            <p className="font-sans text-sm text-textMuted">
+          <div className="min-w-0">
+            <h1 className="font-display text-xl sm:text-3xl text-textPrimary">Researcher Dashboard</h1>
+            <p className="font-sans text-xs sm:text-sm text-textMuted">
               Forecast divergence, climate history, and regional context - all grounded in fetched data.
             </p>
           </div>
           <button
             onClick={onBackToChat}
-            className="ml-auto flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20"
+            className="ml-auto flex items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-3 sm:px-4 py-2 font-mono text-xs uppercase tracking-widest text-accent transition-colors hover:bg-accent/20"
           >
             <MessageSquare className="h-4 w-4" />
-            Ask a question
+            <span className="hidden sm:inline">Ask a question</span>
           </button>
         </header>
 
         {error && <ErrorNote message={error} />}
         {!catalog && !error && <Spinner label="Loading model catalog..." />}
+
+        <LiveCloudView />
 
         {catalog && (
           <>

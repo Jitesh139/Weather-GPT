@@ -181,7 +181,7 @@ function App() {
       <CanvasController frameIndex={frameIndex} />
       
       <main className="relative z-10">
-        <header ref={headerRef} className="fixed top-0 z-50 w-full flex justify-center p-4 opacity-0">
+        <header ref={headerRef} className="fixed top-0 z-50 w-full flex justify-center px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] opacity-0">
           <Navigation />
         </header>
         <HeroSection />

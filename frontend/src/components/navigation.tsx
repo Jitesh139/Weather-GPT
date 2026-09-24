@@ -65,7 +65,16 @@ function ListItem({ title, children, href, ...props }: React.ComponentPropsWitho
 
 export default function Component() {
   return (
-    <NavigationMenu viewport={false}>
+    <>
+      {/* Mobile: a single compact brand pill - the full mega-menu doesn't
+          fit a phone screen and this is a scroll-driven one-pager anyway,
+          so the primary nav isn't needed to get around. */}
+      <div className="flex md:hidden items-center gap-2 rounded-full border border-white/10 bg-white/5 backdrop-blur-md px-4 py-2">
+        <span className="font-display text-sm text-sky-400">Mausam GPT</span>
+      </div>
+
+      <div className="hidden md:block">
+        <NavigationMenu viewport={false}>
       <NavigationMenuList>
         <NavigationMenuItem>
           <NavigationMenuTrigger>Platform</NavigationMenuTrigger>
@@ -186,6 +195,8 @@ export default function Component() {
           </NavigationMenuContent>
         </NavigationMenuItem>
       </NavigationMenuList>
-    </NavigationMenu>
+        </NavigationMenu>
+      </div>
+    </>
   );
 }

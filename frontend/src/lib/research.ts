@@ -78,6 +78,15 @@ export interface RegionalContext {
   fetched_points: number;
 }
 
+export interface MapCity {
+  id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  current: Record<string, number | string | null>;
+  daily: Record<string, (number | string | null)[]>;
+}
+
 export interface RegionalNarrative {
   narrative: string | null;
   verified: boolean;
@@ -129,6 +138,8 @@ export const fetchHistoricalTrend = (
   );
 
 export const fetchRegionalContext = () => getJson<RegionalContext>('/research/regional-context');
+
+export const fetchMapCities = () => getJson<{ cities: MapCity[] }>('/research/map-cities');
 
 export const fetchRegionalNarrative = () =>
   getJson<RegionalNarrative>('/research/regional-context/narrative');

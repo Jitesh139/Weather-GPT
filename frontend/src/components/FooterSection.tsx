@@ -3,12 +3,12 @@ import { Database, Shield, BookOpen, Activity } from 'lucide-react';
 
 export const FooterSection: React.FC = () => {
   return (
-    <section className="relative w-full h-[40vh] flex flex-col justify-end pointer-events-none">
+    <section className="relative w-full min-h-[40vh] flex flex-col justify-end pointer-events-none">
       {/* Backdrop overlay for glassmorphism */}
       <div className="absolute inset-0 w-full h-full backdrop-blur-[32px] brightness-75 -z-10 pointer-events-auto border-t border-white/5" />
-      
-      <div className="w-full max-w-7xl mx-auto px-6 py-12 pointer-events-auto">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
+
+      <div className="w-full max-w-7xl mx-auto px-5 sm:px-6 py-8 sm:py-12 pointer-events-auto">
+        <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-4 gap-6 sm:gap-8">
           
           <div className="flex flex-col space-y-3">
             <h4 className="font-display text-lg text-textPrimary">Mausam GPT</h4>
@@ -61,7 +61,7 @@ export const FooterSection: React.FC = () => {
 
         </div>
         
-        <div className="mt-12 pt-6 border-t border-white/10 flex justify-between items-center text-xs font-mono text-textMuted">
+        <div className="mt-8 sm:mt-12 pt-6 border-t border-white/10 flex flex-wrap gap-2 justify-between items-center text-xs font-mono text-textMuted">
           <p>© {new Date().getFullYear()} Mausam GPT. All rights reserved.</p>
           <div className="flex items-center space-x-1">
             <Activity className="w-3 h-3" />

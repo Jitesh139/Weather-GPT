@@ -494,6 +494,16 @@ def research_regional_context(db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
 
 
+@app.get("/research/map-cities")
+def research_map_cities(db: Session = Depends(get_db)) -> dict:
+    """Pinned cities and their current conditions for the Live Cloud View
+    map. Same Open-Meteo integration as every other number in the app."""
+    try:
+        return research.map_cities(db)
+    except _WEATHER_FETCH_ERRORS as exc:
+        raise HTTPException(status_code=502, detail=f"Weather provider error: {exc}") from exc
+
+
 @app.get("/research/regional-context/narrative")
 def research_regional_narrative(db: Session = Depends(get_db)) -> dict:
     """Optional grounded description of the regional panel.
