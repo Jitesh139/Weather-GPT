@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { background:#111; color:#eee; font:13px monospace; margin:8px; }
+  #map { width:700px; height:300px; background:#0b1220; }
+  pre { color:#fde047; white-space:pre-wrap; font-size:13px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<pre id="out">starting...</pre>
+<script type="module">
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import * as OM from '@openmeteo/weather-map-layer';
+
+const out = document.getElementById('out');
+const log = [];
+const say = (s) => { log.push(s); out.textContent = log.join('\n'); };
+
+const map = L.map('map', { center: [22.5, 79], zoom: 5, minZoom: 3, maxZoom: 9 });
+const adapter = OM.addLeafletProtocolSupport(L);
+adapter.addProtocol('om', OM.omProtocol);
+const bb = map.getBounds();
+OM.updateCurrentBounds([bb.getWest(), bb.getSouth(), bb.getEast(), bb.getNorth()]);
+
+const BASE = 'https://openmeteo.s3.amazonaws.com/data_spatial/dwd_icon/latest.json?time_step=current_time_1H&variable=';
+// rAF-based wait: setTimeout is throttled in headless, requestAnimationFrame is not.
+const waitFrames = (n) => new Promise((res) => {
+  let i = 0;
+  const tick = () => (++i >= n ? res() : requestAnimationFrame(tick));
+  requestAnimationFrame(tick);
+});
+
+async function probe(v) {
+  const url = BASE + v;
+  const layer = adapter.createTileLayer('om://' + url, { opacity: 0.6 });
+  layer.addTo(map);
+  let line = `${v}: pending`;
+  const idx = log.length;
+  log.push(line);
+  for (let attempt = 1; attempt <= 40; attempt++) {
+    await waitFrames(30);
+    try {
+      const r = await OM.getValueFromLatLong(23.2599, 77.4126, url);
+      if (r && Number.isFinite(r.value)) {
+        line = `${v}: value=${r.value.toFixed(3)} m/s = ${(r.value*3.6).toFixed(1)} km/h dir=${r.direction ?? 'n/a'} [try ${attempt}]`;
+        break;
+      }
+      line = `${v}: NaN (try ${attempt})`;
+    } catch (e) {
+      line = `${v}: ERROR ${e && e.message}`;
+      break;
+    }
+    log[idx] = line;
+    out.textContent = log.join('\n');
+  }
+  log[idx] = line;
+  out.textContent = log.join('\n');
+  map.removeLayer(layer);
+}
+
+await probe('wind_speed_10m');
+await probe('wind_u_component_10m');
+say('DONE');
+</script>
+</body>
+</html>

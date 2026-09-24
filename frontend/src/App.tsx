@@ -155,9 +155,14 @@ function App() {
   };
 
   if (route.startsWith(RESEARCHER_ROUTE)) {
+    // No CanvasController here: it holds all 300 background frames decoded in
+    // memory (~2 GB), and on integrated graphics that starves the compositor
+    // of the VRAM the map's tile layers need - tiles come back as corrupted
+    // scanlines or never rasterise at all. The dashboard covers the
+    // background almost entirely anyway, so it gets the canvas's own base
+    // colour instead.
     return (
-      <div className="relative w-full text-textPrimary">
-        <CanvasController frameIndex={frameIndex} />
+      <div className="relative min-h-[100dvh] w-full bg-[#090D16] text-textPrimary">
         <ResearcherDashboard
           onHome={() => {
             setActivePersona(null);

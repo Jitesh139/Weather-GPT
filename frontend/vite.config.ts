@@ -14,6 +14,14 @@ export default defineConfig({
       "@": fileURLToPath(new URL('./src', import.meta.url))
     },
   },
+  optimizeDeps: {
+    // The Open-Meteo layer locates its WebAssembly binary with
+    // `new URL('om_file_format.web.wasm', import.meta.url)`. Pre-bundling
+    // rewrites that module into .vite/deps/, where the .wasm does not exist,
+    // so the reader 404s and no weather tiles are ever requested. Serving the
+    // package from its own directory keeps the relative path valid.
+    exclude: ['@openmeteo/weather-map-layer'],
+  },
   server: {
     // Proxy the backend's API routes so the dev server and the API share
     // an origin - same as production, where the backend serves this build

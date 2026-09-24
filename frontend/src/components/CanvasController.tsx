@@ -9,43 +9,62 @@ export const CanvasController: React.FC<CanvasControllerProps> = ({ frameIndex }
   const [images, setImages] = useState<HTMLImageElement[]>([]);
   const [loaded, setLoaded] = useState(false);
 
-  // Preload 300 frames
+  // Preload 300 frames.
+  //
+  // These are ~73 MB of JPEGs. Requesting and decoding them all at once
+  // saturates the browser's image decoder, which delays first paint of
+  // everything else on the page - it kept the Leaflet tiles on the researcher
+  // dashboard blank for tens of seconds. Frames are therefore fetched at low
+  // priority in small batches, and the render loop clamps to whatever has
+  // arrived, so the animation fills in progressively instead of blocking.
   useEffect(() => {
+    let cancelled = false;
+    const totalFrames = 300;
+    const batchSize = 12;
+
+    const loadFrame = (i: number) =>
+      new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.fetchPriority = 'low';
+        img.src = `/frames/frame-${i.toString().padStart(3, '0')}.jpg`;
+
+        // Decode before resolving to prevent GPU stalls
+        img.decode()
+          .then(() => resolve(img))
+          .catch(() => {
+            // Fallback for decoding errors or if testing locally without hardware decoding
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+          });
+      });
+
     const preloadImages = async () => {
-      const promises: Promise<HTMLImageElement>[] = [];
-      const totalFrames = 300;
-
-      for (let i = 1; i <= totalFrames; i++) {
-        const promise = new Promise<HTMLImageElement>((resolve, reject) => {
-          const img = new Image();
-          const frameStr = i.toString().padStart(3, '0');
-          img.src = `/frames/frame-${frameStr}.jpg`;
-
-          // Decode before resolving to prevent GPU stalls
-          img.decode()
-            .then(() => resolve(img))
-            .catch(() => {
-              // Fallback for decoding errors or if testing locally without hardware decoding
-              img.onload = () => resolve(img);
-              img.onerror = reject;
-            });
-        });
-        promises.push(promise);
-      }
-
       try {
-        const firstImage = await promises[0];
+        const firstImage = await loadFrame(1);
+        if (cancelled) return;
         setImages([firstImage]);
         setLoaded(true);
 
-        const loadedImages = await Promise.all(promises);
-        setImages(loadedImages);
+        const collected: HTMLImageElement[] = [firstImage];
+        for (let start = 2; start <= totalFrames; start += batchSize) {
+          const batch: Promise<HTMLImageElement>[] = [];
+          for (let i = start; i < start + batchSize && i <= totalFrames; i++) {
+            batch.push(loadFrame(i));
+          }
+          const done = await Promise.all(batch);
+          if (cancelled) return;
+          collected.push(...done);
+          setImages([...collected]);
+        }
       } catch (err) {
         console.error("Error preloading images:", err);
       }
     };
 
     preloadImages();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Render loop
