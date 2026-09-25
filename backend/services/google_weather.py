@@ -52,9 +52,9 @@ def _raise_for_transient(exc: httpx.HTTPStatusError) -> None:
     wait=wait_exponential(multiplier=1, min=1, max=10),
     reraise=True,
 )
-def _get_json(params: dict[str, Any]) -> dict[str, Any]:
+def _get_json(params: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
     try:
-        response = _http.get(CURRENT_CONDITIONS_URL, params=params)
+        response = _http.get(CURRENT_CONDITIONS_URL, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as exc:
@@ -72,12 +72,14 @@ def fetch_current_conditions(latitude: float, longitude: float) -> dict[str, Any
         raise GoogleWeatherConfigError("GOOGLE_WEATHER_API_KEY is not set")
 
     data = _get_json(
-        {
-            "key": settings.google_weather_api_key,
+        params={
             "location.latitude": latitude,
             "location.longitude": longitude,
             "unitsSystem": "METRIC",
-        }
+        },
+        headers={
+            "X-Goog-Api-Key": settings.google_weather_api_key,
+        },
     )
 
     try:

@@ -9,5 +9,5 @@ pgdata/
 .vscode/
 .idea/
 *.db
-run.log
+*.log
 run.pid.txt

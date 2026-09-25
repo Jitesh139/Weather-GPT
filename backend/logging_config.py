@@ -20,6 +20,9 @@ def configure_logging() -> None:
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    # Silence verbose HTTP request logging which can log query parameters
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def log_query(
