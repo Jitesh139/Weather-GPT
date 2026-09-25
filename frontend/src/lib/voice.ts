@@ -26,14 +26,22 @@ export interface VoiceHandlers {
   onError: (message: string) => void;
   onRecordingChange: (recording: boolean) => void;
   onProcessingChange: (processing: boolean) => void;
+  /** Spoken reply started (true) or finished/failed (false). */
+  onSpeakingChange?: (speaking: boolean) => void;
+  /** The mic picked up the user starting to talk. */
+  onSpeechStart?: () => void;
 }
 
 export interface VoiceController {
   provider: VoiceProvider;
   supported: boolean;
   start: () => void;
+  /** Stops recording and transcribes what was heard. */
   stop: () => void;
-  speak: (text: string) => void;
+  /** Stops recording and throws the audio away - no transcript, no error. */
+  abort: () => void;
+  /** Resolves once playback has ended, or failed. */
+  speak: (text: string) => Promise<void>;
   dispose: () => void;
 }
 
@@ -123,10 +131,12 @@ function createWebSpeechController(config: VoiceConfig, handlers: VoiceHandlers)
     handlers.onRecordingChange(false);
     handlers.onTranscript(event.results[0][0].transcript);
   };
-  recognition.onerror = () => {
+  recognition.onerror = (event: any) => {
     handlers.onRecordingChange(false);
+    if (event?.error === 'aborted') return; // abort() was called on purpose
     handlers.onError("I couldn't hear that clearly. Please try again, or type your question.");
   };
+  recognition.onspeechstart = () => handlers.onSpeechStart?.();
   recognition.onend = () => handlers.onRecordingChange(false);
 
   return {
@@ -141,13 +151,27 @@ function createWebSpeechController(config: VoiceConfig, handlers: VoiceHandlers)
       }
     },
     stop: () => recognition.stop(),
-    speak: (text: string) => {
-      if (!('speechSynthesis' in window)) return;
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = locale;
-      window.speechSynthesis.speak(utterance);
+    abort: () => {
+      try {
+        recognition.abort();
+      } catch {
+        // already stopped
+      }
+      handlers.onRecordingChange(false);
     },
+    speak: (text: string) =>
+      new Promise<void>((resolve) => {
+        if (!('speechSynthesis' in window)) return resolve();
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = locale;
+        utterance.onstart = () => handlers.onSpeakingChange?.(true);
+        utterance.onend = utterance.onerror = () => {
+          handlers.onSpeakingChange?.(false);
+          resolve();
+        };
+        window.speechSynthesis.speak(utterance);
+      }),
     dispose: () => {
       try {
         recognition.abort();
@@ -237,6 +261,7 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
         const rms = Math.sqrt(sum / samples.length);
         const blockMs = (samples.length / audioCtx.sampleRate) * 1000;
         if (rms > SPEECH_RMS) {
+          if (!heardSpeech) handlers.onSpeechStart?.();
           heardSpeech = true;
           silentMs = 0;
         } else if (heardSpeech && rms < SILENCE_RMS) {
@@ -267,6 +292,12 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
     const wav = encodeWavPCM16(mergeBuffers(finished.chunks), sampleRate);
     handlers.onProcessingChange(true);
     void transcribe(wav, sampleRate);
+  };
+
+  const abort = () => {
+    const finished = teardown();
+    handlers.onRecordingChange(false);
+    if (finished) void finished.audioCtx.close();
   };
 
   const transcribe = async (wav: ArrayBuffer, sampleRate: number) => {
@@ -304,7 +335,7 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
     }
   };
 
-  const speak = async (text: string) => {
+  const speak = async (text: string): Promise<void> => {
     speechToken += 1;
     const token = speechToken;
     currentAudio?.pause();
@@ -324,10 +355,21 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
 
       const audio = new Audio(`data:audio/${data.audio_format ?? 'wav'};base64,${data.audio_base64}`);
       currentAudio = audio;
-      await audio.play().catch(() => undefined);
+      // Resolve on end, error, or pause (a newer answer or dispose() cut it off).
+      await new Promise<void>((resolve) => {
+        audio.onended = () => resolve();
+        audio.onerror = () => resolve();
+        audio.onpause = () => resolve();
+        audio.play().then(
+          () => handlers.onSpeakingChange?.(true),
+          () => resolve(),
+        );
+      });
     } catch {
       // A TTS failure must never block or hide the text answer, which is
       // already displayed by the time this runs.
+    } finally {
+      if (token === speechToken) handlers.onSpeakingChange?.(false);
     }
   };
 
@@ -336,7 +378,8 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
     supported: true,
     start: () => void start(),
     stop,
-    speak: (text: string) => void speak(text),
+    abort,
+    speak,
     dispose: () => {
       disposed = true;
       const finished = teardown();
@@ -357,7 +400,8 @@ function unsupportedController(
     supported: false,
     start: () => handlers.onError(message),
     stop: () => undefined,
-    speak: () => undefined,
+    abort: () => undefined,
+    speak: () => Promise.resolve(),
     dispose: () => undefined,
   };
 }

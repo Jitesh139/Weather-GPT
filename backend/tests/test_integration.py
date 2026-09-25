@@ -109,3 +109,59 @@ def test_invalid_location_query_returns_explicit_error(client):
     assert body["answer"] is None
     assert body["error"] is not None
     assert body["verified"] is False
+
+
+@respx.mock
+def test_farmer_crop_context_goes_to_generator_and_verifier(client, monkeypatch):
+    """A farmer's saved crop skips the fast-path template (which can't talk
+    about crops), reaches the generator prompt, and counts as grounding in
+    the verifier - so "planted 21 days ago" doesn't fail the number diff."""
+    respx.get(weather.GEOCODING_URL).mock(return_value=httpx.Response(200, json=SAMPLE_GEOCODE_RESPONSE))
+    respx.get(weather.FORECAST_URL).mock(return_value=httpx.Response(200, json=SAMPLE_FORECAST_RESPONSE))
+
+    def generate_fn(system_prompt, user_query, tools, tool_executor, max_tool_iterations):
+        result = tool_executor("fetch_weather", {"location": "Mumbai", "parameter": "temperature"})
+        temp = result["current"]["temperature_2m"]
+        return GenerationResult(
+            draft_text=f"It's {temp}°C in Mumbai; your wheat, planted 21 days ago, may need water this evening.",
+            raw_tool_data=[result],
+            tool_call_count=1,
+        )
+
+    verify_sources = []
+
+    def verify_fn(draft_answer, source_data, claims_to_check):
+        verify_sources.append(source_data)
+        return VerificationResult(passed=True, mismatches=[])
+
+    fake_generator = FakeLLMClient(generate_fn=generate_fn)
+    fake_verifier = FakeLLMClient(verify_fn=verify_fn)
+
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "get_generator_client", lambda: fake_generator)
+    monkeypatch.setattr(main_module, "get_verifier_client", lambda: fake_verifier)
+
+    response = client.post(
+        "/query",
+        json={
+            "text": "what is the temperature in Mumbai",  # a fast-path question on its own
+            "input_mode": "voice",
+            "crop_context": {"crop": "wheat", "planted_days_ago": 21},
+        },
+    )
+
+    body = response.json()
+    assert body["path"] == "slow"
+    assert body["verified"] is True
+    assert "wheat" in body["answer"]
+    assert "growing wheat (planted 21 days ago)" in fake_generator.generate_calls[0]["system_prompt"]
+    assert verify_sources[0]["farmer_profile"] == {"crop": "wheat", "planted_days_ago": 21}
+
+
+def test_query_rejects_invalid_crop_context(client):
+    response = client.post(
+        "/query",
+        json={"text": "weather in Mumbai", "input_mode": "text", "crop_context": {"crop": "", "planted_days_ago": -3}},
+    )
+    assert response.status_code == 422

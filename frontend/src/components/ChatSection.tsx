@@ -1,23 +1,118 @@
 import { useState, forwardRef, useRef, useEffect } from 'react';
-import { Mic, Send, ShieldCheck, Activity, ChevronDown, ChevronUp, AlertCircle, ArrowLeft } from 'lucide-react';
+import { Mic, Send, ShieldCheck, Activity, ChevronDown, ChevronUp, AlertCircle, ArrowLeft, Trash2, Sprout } from 'lucide-react';
 import type { Persona } from '../App';
 import { fetchWeatherQuery, type QueryResponse, type QueryError } from '../lib/api';
-import { createVoiceController, fetchVoiceConfig, type VoiceController } from '../lib/voice';
+import { createVoiceController, fetchVoiceConfig, type VoiceConfig, type VoiceController } from '../lib/voice';
+import {
+  daysSincePlanted,
+  loadFarmerProfile,
+  markOnboardingSkipped,
+  plantedLabel,
+  toCropContext,
+  wasOnboardingSkipped,
+  type FarmerProfile,
+} from '../lib/farmerProfile';
+import { FarmerOnboarding } from './FarmerOnboarding';
 
 interface ChatSectionProps {
   activePersona: Persona;
   onBack: () => void;
 }
 
+type ChatMessage =
+  | { id: string; role: 'user'; text: string }
+  | { id: string; role: 'assistant'; response: QueryResponse }
+  | { id: string; role: 'error'; text: string };
+
+const HISTORY_KEY = 'mausam-gpt-chat-history';
+// Each answer carries its raw forecast JSON, so cap what localStorage holds.
+const MAX_HISTORY = 60;
+
+function loadHistory(): ChatMessage[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(HISTORY_KEY) ?? '[]');
+    return Array.isArray(saved) ? saved : [];
+  } catch {
+    return [];
+  }
+}
+
+function newId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function AssistantMessage({ response }: { response: QueryResponse }) {
+  const [showTelemetry, setShowTelemetry] = useState(false);
+  return (
+    <div className="max-w-[90%] self-start rounded-2xl rounded-bl-sm border border-white/10 bg-white/5 px-4 py-3 animate-in fade-in slide-in-from-bottom-2">
+      <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] font-mono uppercase sm:text-xs">
+        <span className={`px-2 py-0.5 rounded-sm ${response.path === 'fast' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'}`}>
+          {response.path} Path
+        </span>
+        {response.verified && (
+          <span className="flex items-center space-x-1 text-emerald-400">
+            <ShieldCheck className="w-3 h-3" />
+            <span>Verified Grounded Data</span>
+          </span>
+        )}
+        <span className="text-textMuted ml-auto">{response.latency_ms}ms</span>
+      </div>
+
+      <div className="text-base sm:text-lg font-sans text-textPrimary leading-relaxed">{response.answer}</div>
+
+      {response.source_data && (
+        <div className="mt-3 border-t border-white/5 pt-3">
+          <button
+            onClick={() => setShowTelemetry(!showTelemetry)}
+            className="flex items-center justify-between w-full text-xs font-mono text-textMuted hover:text-textPrimary transition-colors"
+          >
+            <span className="flex items-center space-x-2">
+              <Activity className="w-4 h-4" />
+              <span>Raw Open-Meteo Telemetry</span>
+            </span>
+            {showTelemetry ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+          {showTelemetry && (
+            <div className="mt-3 bg-black/40 rounded-lg p-3 font-mono text-xs text-textMuted overflow-x-auto border border-white/5">
+              <pre>{JSON.stringify(response.source_data, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePersona, onBack }, ref) => {
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [response, setResponse] = useState<QueryResponse | null>(null);
-  const [error, setError] = useState<QueryError | null>(null);
-  const [showTelemetry, setShowTelemetry] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>(loadHistory);
   const [isFullScreen, setIsFullScreen] = useState(false);
-  
+  const logRef = useRef<HTMLDivElement | null>(null);
+  const [voiceConfig, setVoiceConfig] = useState<VoiceConfig | null>(null);
+
+  // Farmer onboarding: asked once, until answered; a skip holds for the session.
+  const [farmerProfile, setFarmerProfile] = useState<FarmerProfile | null>(loadFarmerProfile);
+  const [onboardingSkipped, setOnboardingSkipped] = useState(wasOnboardingSkipped);
+  const [editingCrop, setEditingCrop] = useState(false);
+  const isFarmer = activePersona === 'farmer';
+  const showOnboarding = isFarmer && (editingCrop || (!farmerProfile && !onboardingSkipped));
+
+  const addMessage = (message: ChatMessage) => setMessages((prev) => [...prev, message]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.slice(-MAX_HISTORY)));
+    } catch {
+      // Storage full or disabled - the chat still works, it just won't persist.
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: 'smooth' });
+  }, [messages, loading]);
+
   const voiceRef = useRef<VoiceController | null>(null);
   // The controller is built once, but its callbacks must reach the latest
   // handleQuery, which is redefined on every render.
@@ -43,12 +138,10 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
 
     fetchVoiceConfig().then((config) => {
       if (disposed) return;
+      setVoiceConfig(config);
       controller = createVoiceController(config, {
-        onTranscript: (transcript) => {
-          setInputText(transcript);
-          handleQueryRef.current(transcript, 'voice');
-        },
-        onError: (message) => setError({ error: message, answer: null }),
+        onTranscript: (transcript) => handleQueryRef.current(transcript, 'voice'),
+        onError: (message) => addMessage({ id: newId(), role: 'error', text: message }),
         onRecordingChange: setIsRecording,
         onProcessingChange: setLoading,
       });
@@ -66,36 +159,34 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
     if (isRecording) {
       voiceRef.current?.stop();
     } else {
-      setError(null);
-      setResponse(null);
       voiceRef.current?.start();
     }
   };
 
   const speakResponse = (text: string) => {
-    voiceRef.current?.speak(text);
+    void voiceRef.current?.speak(text);
   };
 
   const handleQuery = async (text: string, mode: 'text'|'voice' = 'text') => {
     if (!text.trim()) return;
+    setInputText('');
+    addMessage({ id: newId(), role: 'user', text: text.trim() });
     setLoading(true);
-    setError(null);
-    setResponse(null);
-    setShowTelemetry(false);
-    
+
     try {
-      const res = await fetchWeatherQuery({ text, input_mode: mode });
-      setResponse(res);
+      const res = await fetchWeatherQuery({
+        text,
+        input_mode: mode,
+        crop_context: isFarmer && farmerProfile ? toCropContext(farmerProfile) : undefined,
+      });
+      addMessage({ id: newId(), role: 'assistant', response: res });
       if (mode === 'voice') {
         speakResponse(res.answer);
       }
-    } catch (err: any) {
-      setError(err as QueryError);
+    } catch (err) {
+      addMessage({ id: newId(), role: 'error', text: (err as QueryError).error });
     } finally {
       setLoading(false);
-      if (mode === 'text') {
-        setInputText('');
-      }
     }
   };
 
@@ -124,76 +215,104 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
               </button>
               <h2 className="font-display text-lg sm:text-2xl text-textPrimary truncate">Mausam GPT</h2>
             </div>
-          {activePersona && (
-            <span className="text-[10px] sm:text-xs font-mono uppercase tracking-widest text-accent bg-accent/10 px-2 sm:px-3 py-1 rounded-full border border-accent/20 shrink-0 whitespace-nowrap">
-              {activePersona} Lens
-            </span>
-          )}
+          <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+            {messages.length > 0 && (
+              <button
+                onClick={() => setMessages([])}
+                disabled={loading}
+                className="p-2 rounded-lg text-textMuted hover:text-alertRed hover:bg-white/5 transition-colors disabled:opacity-50"
+                title="Clear chat history"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+            {activePersona && (
+              <span className="text-[10px] sm:text-xs font-mono uppercase tracking-widest text-accent bg-accent/10 px-2 sm:px-3 py-1 rounded-full border border-accent/20 whitespace-nowrap">
+                {activePersona} Lens
+              </span>
+            )}
+          </div>
         </div>
 
+        {showOnboarding ? (
+          <FarmerOnboarding
+            voiceConfig={voiceConfig}
+            initial={farmerProfile}
+            onComplete={(profile) => {
+              setFarmerProfile(profile);
+              setEditingCrop(false);
+            }}
+            onSkip={() => {
+              markOnboardingSkipped();
+              setOnboardingSkipped(true);
+              setEditingCrop(false);
+            }}
+          />
+        ) : (
+        <>
+        {isFarmer && (
+          <div lang="hi" className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-textMuted">
+            <Sprout className="h-4 w-4 text-emerald-400" />
+            {farmerProfile ? (
+              <span>
+                फसल: <span className="text-textPrimary">{farmerProfile.cropLabel}</span> · {plantedLabel(daysSincePlanted(farmerProfile))}
+              </span>
+            ) : (
+              <span>फसल नहीं जोड़ी गई</span>
+            )}
+            <button
+              onClick={() => setEditingCrop(true)}
+              disabled={loading || isRecording}
+              className="text-accent underline-offset-2 hover:underline disabled:opacity-50"
+            >
+              {farmerProfile ? 'बदलें' : 'फसल जोड़ें'}
+            </button>
+          </div>
+        )}
+
         {/* Chat Log / Response Area */}
-        <div className={`mb-4 sm:mb-8 flex flex-col justify-end ${isFullScreen ? 'flex-1 overflow-y-auto' : 'min-h-[160px] sm:min-h-[200px]'}`}>
-          {!response && !error && !loading && (
+        <div
+          ref={logRef}
+          data-lenis-prevent
+          className={`mb-4 sm:mb-6 flex flex-col gap-3 overflow-y-auto ${isFullScreen ? 'flex-1' : 'min-h-[160px] sm:min-h-[200px] max-h-[60vh]'}`}
+        >
+          {messages.length === 0 && !loading && (
             <div className="text-center text-textMuted font-sans my-auto">
               Awaiting query...
             </div>
           )}
-          
+
+          {messages.map((m) => {
+            if (m.role === 'user') {
+              return (
+                <div
+                  key={m.id}
+                  className="max-w-[85%] self-end rounded-2xl rounded-br-sm bg-accent/15 border border-accent/25 px-4 py-2.5 text-base font-sans text-textPrimary whitespace-pre-wrap break-words animate-in fade-in slide-in-from-bottom-2"
+                >
+                  {m.text}
+                </div>
+              );
+            }
+            if (m.role === 'error') {
+              return (
+                <div
+                  key={m.id}
+                  className="max-w-[90%] self-start bg-alertRed/20 border border-alertRed text-alertRed px-4 py-3 rounded-2xl rounded-bl-sm flex items-start space-x-3 animate-in fade-in slide-in-from-bottom-2"
+                >
+                  <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <div className="font-mono text-sm leading-relaxed">{m.text}</div>
+                </div>
+              );
+            }
+            return <AssistantMessage key={m.id} response={m.response} />;
+          })}
+
           {loading && (
-            <div className="flex justify-center items-center h-full">
+            <div className="self-start rounded-2xl rounded-bl-sm border border-white/10 bg-white/5 px-4 py-3.5">
               <div className="animate-pulse flex space-x-2">
                 <div className="w-2 h-2 bg-accent rounded-full"></div>
                 <div className="w-2 h-2 bg-accent rounded-full animation-delay-200"></div>
                 <div className="w-2 h-2 bg-accent rounded-full animation-delay-400"></div>
-              </div>
-            </div>
-          )}
-
-          {error && (
-            <div className="bg-alertRed/20 border border-alertRed text-alertRed p-4 rounded-xl flex items-start space-x-3 mb-4 animate-in fade-in slide-in-from-bottom-2">
-              <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
-              <div className="font-mono text-sm leading-relaxed">
-                {error.error}
-              </div>
-            </div>
-          )}
-
-          {response && (
-            <div className="flex flex-col space-y-4 animate-in fade-in slide-in-from-bottom-2">
-              <div className="flex items-center space-x-3 text-xs font-mono uppercase">
-                <span className={`px-2 py-1 rounded-sm ${response.path === 'fast' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-sky-500/20 text-sky-400 border border-sky-500/30'}`}>
-                  {response.path} Path
-                </span>
-                {response.verified && (
-                  <span className="flex items-center space-x-1 text-emerald-400">
-                    <ShieldCheck className="w-3 h-3" />
-                    <span>Verified Grounded Data</span>
-                  </span>
-                )}
-                <span className="text-textMuted ml-auto">{response.latency_ms}ms</span>
-              </div>
-              
-              <div className="text-base sm:text-lg font-sans text-textPrimary leading-relaxed">
-                {response.answer}
-              </div>
-
-              <div className="mt-4 border-t border-white/5 pt-4">
-                <button 
-                  onClick={() => setShowTelemetry(!showTelemetry)}
-                  className="flex items-center justify-between w-full text-xs font-mono text-textMuted hover:text-textPrimary transition-colors"
-                >
-                  <span className="flex items-center space-x-2">
-                    <Activity className="w-4 h-4" />
-                    <span>Raw Open-Meteo Telemetry</span>
-                  </span>
-                  {showTelemetry ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                </button>
-                
-                {showTelemetry && (
-                  <div className="mt-3 bg-black/40 rounded-lg p-3 font-mono text-xs text-textMuted overflow-x-auto border border-white/5">
-                    <pre>{JSON.stringify(response.source_data, null, 2)}</pre>
-                  </div>
-                )}
               </div>
             </div>
           )}
@@ -237,6 +356,8 @@ export const ChatSection = forwardRef<HTMLElement, ChatSectionProps>(({ activePe
             </button>
           </div>
           </div>
+        </>
+        )}
         </div>
       </div>
     </section>

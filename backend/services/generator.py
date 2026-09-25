@@ -4,15 +4,18 @@ enforced by LLMClient.generate_with_tools (see llm_client.py), not just
 prompted.
 """
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
-from models.schemas import DraftAnswer
+from models.schemas import CropContext, DraftAnswer
 from services import weather
 from services.llm_client import GenerationResult, LLMClient, ToolSpec
 from services.weather import WeatherServiceError
 
 logger = logging.getLogger(__name__)
+
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
 
 SYSTEM_PROMPT = (
     "You are WeatherGPT's answer generator. You MUST call the fetch_weather tool to get "
@@ -33,6 +36,23 @@ SYSTEM_PROMPT = (
     "names and the numbers themselves exactly as the tool returned them - translate the "
     "sentence around them, never the data."
 )
+
+
+def crop_context_prompt(crop_context: CropContext) -> str:
+    planted = (
+        f"planted {crop_context.planted_days_ago} days ago"
+        if crop_context.planted_days_ago is not None
+        else "planting date unknown"
+    )
+    return (
+        f"\n\nFARMER CONTEXT: this user is a farmer growing {crop_context.crop} ({planted}). "
+        "Work out the crop's likely growth stage from that. When it is relevant to the question, "
+        "add one short sentence relating the weather to this crop and stage - irrigation timing, "
+        "pest or disease risk, frost or heat stress at a sensitive stage. Don't repeat the crop "
+        "details back unless it helps, and keep the general-guidance caveat brief. This context "
+        "is written in English, but the LANGUAGE rule still applies: answer in the language AND "
+        "script of the user's question (a question in Devanagari gets an answer in Devanagari)."
+    )
 
 
 def get_weather_tool_spec() -> ToolSpec:
@@ -83,8 +103,11 @@ def run_generator(
     db: Session,
     mismatch_hint: str | None = None,
     language: str | None = None,
+    crop_context: CropContext | None = None,
 ) -> DraftAnswer:
     system_prompt = SYSTEM_PROMPT
+    if crop_context:
+        system_prompt += crop_context_prompt(crop_context)
     # The prompt already tells the model to mirror the user's language;
     # naming the detected one as well removes the ambiguity on short or
     # romanized queries, where "same language as the user" is a genuinely
@@ -93,6 +116,13 @@ def run_generator(
         system_prompt += (
             f"\n\nThe user's question was detected as language code '{language}' - answer in it."
         )
+        # Without this the model drifts into romanized Hindi on Devanagari
+        # questions, most often when the English farmer context is present.
+        if _DEVANAGARI_RE.search(query):
+            system_prompt += (
+                " The question is written in Devanagari script, so write the whole answer in "
+                "Devanagari - not in Latin letters, and with no words from any other language."
+            )
     if mismatch_hint:
         system_prompt += (
             f"\n\nNOTE: a previous draft of your answer failed verification for this reason: "

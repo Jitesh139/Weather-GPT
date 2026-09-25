@@ -1,9 +1,16 @@
 export type InputMode = 'voice' | 'text';
 export type RoutingPath = 'fast' | 'slow';
 
+export interface CropContext {
+  crop: string;
+  planted_days_ago: number | null;
+}
+
 export interface QueryRequest {
   text: string;
   input_mode: InputMode;
+  /** Farmer persona only: their saved crop, so answers can speak to it. */
+  crop_context?: CropContext;
 }
 
 export interface QueryResponse {

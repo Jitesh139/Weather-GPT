@@ -5,9 +5,18 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class CropContext(BaseModel):
+    """What the farmer told the onboarding flow: their crop and how long
+    ago it was planted. Sent with every farmer query."""
+
+    crop: str = Field(min_length=1, max_length=60)
+    planted_days_ago: Optional[int] = Field(default=None, ge=0, le=730)
+
+
 class QueryRequest(BaseModel):
     text: str
     input_mode: Literal["voice", "text"]
+    crop_context: Optional[CropContext] = None
 
 
 class GeocodeResult(BaseModel):

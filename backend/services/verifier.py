@@ -39,8 +39,18 @@ def diff_numbers(draft_numbers: list[float], source_numbers: list[float], tolera
     return mismatches
 
 
-def run_verifier(draft: DraftAnswer, llm_client: LLMClient) -> VerificationResult:
-    source_numbers = _flatten_numbers(draft.raw_tool_data)
+def run_verifier(
+    draft: DraftAnswer,
+    llm_client: LLMClient,
+    farmer_profile: dict[str, Any] | None = None,
+) -> VerificationResult:
+    source_data: dict[str, Any] = {"tool_results": draft.raw_tool_data}
+    # The farmer's own crop details are grounding too - "planted 21 days
+    # ago" must not fail the number diff for being absent from the forecast.
+    if farmer_profile:
+        source_data["farmer_profile"] = farmer_profile
+
+    source_numbers = _flatten_numbers(source_data)
     draft_numbers = extract_numbers(draft.text)
 
     numeric_mismatches = diff_numbers(draft_numbers, source_numbers)
@@ -49,4 +59,4 @@ def run_verifier(draft: DraftAnswer, llm_client: LLMClient) -> VerificationResul
 
     # Numbers all check out programmatically - the LLM verifier only needs
     # to judge qualitative/descriptive claims now.
-    return llm_client.verify(draft.text, {"tool_results": draft.raw_tool_data})
+    return llm_client.verify(draft.text, source_data)

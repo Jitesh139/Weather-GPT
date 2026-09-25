@@ -247,6 +247,11 @@ def _run_fast_path(text_query: str, db: Session, language: str = lang.DEFAULT_LA
 def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
     total_start = time.monotonic()
     path, reason = classify_with_reason(request.text)
+    # The fast path is a fixed template that can't speak to a crop, so a
+    # farmer with a saved crop always gets the generator.
+    if request.crop_context and path == "fast":
+        path, reason = "slow", "farmer crop context"
+    farmer_profile = request.crop_context.model_dump() if request.crop_context else None
     # Answer in whatever language the question came in. Non-English
     # queries match none of the router's English FAST patterns, so they
     # land on the SLOW path by default and are handled by the generator
@@ -279,11 +284,13 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
 
     try:
         gen_start = time.monotonic()
-        draft = run_generator(request.text, generator_client, db, language=query_language)
+        draft = run_generator(
+            request.text, generator_client, db, language=query_language, crop_context=request.crop_context
+        )
         gen_ms = int((time.monotonic() - gen_start) * 1000)
 
         verify_start = time.monotonic()
-        verification = run_verifier(draft, verifier_client)
+        verification = run_verifier(draft, verifier_client, farmer_profile)
         verify_ms = int((time.monotonic() - verify_start) * 1000)
         log_verification(
             db,
@@ -304,11 +311,12 @@ def query(request: QueryRequest, db: Session = Depends(get_db)) -> FinalAnswer:
                 db,
                 mismatch_hint="; ".join(verification.mismatches),
                 language=query_language,
+                crop_context=request.crop_context,
             )
             gen_ms += int((time.monotonic() - gen_start) * 1000)
 
             verify_start = time.monotonic()
-            verification = run_verifier(draft, verifier_client)
+            verification = run_verifier(draft, verifier_client, farmer_profile)
             verify_ms += int((time.monotonic() - verify_start) * 1000)
             log_verification(
                 db,

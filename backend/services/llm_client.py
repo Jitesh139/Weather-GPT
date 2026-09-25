@@ -123,6 +123,13 @@ def _verify_prompt(draft_answer: str, source_data: dict[str, Any], claims_to_che
         f"Draft answer:\n{draft_answer}\n\n"
         f"Source data (JSON):\n{json.dumps(source_data, default=str)}\n"
     )
+    if "farmer_profile" in source_data:
+        prompt += (
+            "\nThe source data includes the farmer's crop and planting time. General crop advice "
+            "(irrigation timing, pest or disease risk, frost or heat stress) that follows "
+            "reasonably from the weather data and that crop/stage is acceptable - only flag it "
+            "if it contradicts the weather data.\n"
+        )
     if claims_to_check:
         prompt += f"\nClaims flagged for special attention: {claims_to_check}\n"
     return prompt
