@@ -40,13 +40,13 @@ if (-not (Test-Path (Join-Path $root 'frontend\node_modules'))) {
 if (-not $env:DATABASE_URL) { $env:DATABASE_URL = 'sqlite:///dev.db' }
 
 Write-Host "Backend  -> http://localhost:8000  (DATABASE_URL=$env:DATABASE_URL)" -ForegroundColor Green
-Start-Process powershell -ArgumentList @(
+Start-Process powershell -WorkingDirectory (Join-Path $root 'backend') -ArgumentList @(
     '-NoExit', '-Command',
-    "Set-Location '$root\backend'; `$env:DATABASE_URL='$env:DATABASE_URL'; & '$python' -m uvicorn main:app --reload --port 8000"
+    "`$env:DATABASE_URL = '$env:DATABASE_URL'; & '$python' -m uvicorn main:app --reload --port 8000"
 )
 
 Write-Host 'Frontend -> http://localhost:5173  (open this one)' -ForegroundColor Green
-Start-Process powershell -ArgumentList @(
+Start-Process powershell -WorkingDirectory (Join-Path $root 'frontend') -ArgumentList @(
     '-NoExit', '-Command',
-    "Set-Location '$root\frontend'; npm run dev"
+    'npm run dev'
 )
