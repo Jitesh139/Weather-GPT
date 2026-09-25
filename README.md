@@ -136,7 +136,7 @@ backend picks up `frontend/dist` automatically.
 | `VOICE_PROVIDER` | Optional | `web_speech` (default, zero-config), `bhashini`, or `google` |
 | `BHASHINI_USER_ID` / `BHASHINI_API_KEY` | Voice, only if `VOICE_PROVIDER=bhashini` | Register at https://bhashini.gov.in/ulca/user/register, generate a key from "My Profile" |
 | `BHASHINI_PIPELINE_ID` / `BHASHINI_LANGUAGE` / `BHASHINI_TTS_GENDER` | Optional (Bhashini only) | Defaults to a community-referenced pipeline ID, Hindi, female voice - see caveats below |
-| `GOOGLE_TRANSLATE_MODEL` / `GOOGLE_TTS_MODEL` | Optional (`VOICE_PROVIDER=google` only) | Only needs `GEMINI_API_KEY` above - no separate signup. See "Google voice integration" below |
+| `GOOGLE_ASR_MODEL` / `GOOGLE_TTS_MODEL` | Optional (`VOICE_PROVIDER=google` only) | Only needs `GEMINI_API_KEY` above - no separate signup. See "Google voice integration" below |
 
 ## Running tests locally (no Docker, no API keys needed)
 
@@ -206,14 +206,10 @@ regression tests (`tests/test_llm_client_gemini.py`,
    to exist - the live API returned a 404 naming the real model,
    `gemini-3.1-flash-tts-preview` (confirmed via `client.models.list()`
    against the real API key), which is now the default.
-7. The Gemini Live translate model (`gemini-3.5-live-translate-preview`,
-   used for ASR - see "Google voice integration" below) does not
-   reliably send `turn_complete`, and sending a whole pre-recorded clip
-   in one instantaneous burst caused the server to only partially
-   transcribe it. Fixed by pacing the audio send to real-time (matching
-   each 100ms chunk's actual duration) with 1s of trailing silence for
-   server-side voice-activity detection, and capping the receive loop by
-   message count instead of waiting for `turn_complete`.
+7. ASR originally used the Gemini Live translate model, which had to be
+   fed audio at real-time pace and took ~20s for a 3s clip (and sometimes
+   dropped words). Replaced by one-shot transcription with
+   `gemini-3.5-flash-lite` (~1.7s).
 
 ## Researcher dashboard
 
@@ -346,23 +342,24 @@ same `GEMINI_API_KEY` already used by the LLM pipeline, no separate
 signup needed. This was run live end-to-end during development (unlike
 the Bhashini integration below, which remains unverified):
 
-- **ASR** (`services/google_voice_client.speech_to_text`): uses
-  `gemini-3.5-live-translate-preview` (Gemini's Live API). The model
-  returns both an input transcription (what was actually said, in the
-  speaker's own language) and an English translation; this returns the
-  **input transcription**, so the user's language survives to `/query`
-  and the answer can come back in it. The translation is the fallback for
-  when the input transcription doesn't arrive.
+- **ASR** (`services/google_voice_client.speech_to_text`): a single
+  `generate_content` call to `GOOGLE_ASR_MODEL` (default
+  `gemini-3.5-flash-lite`, minimal thinking) with the audio inline. It
+  returns what was said in the speaker's own language, so the answer can
+  come back in it.
 - **TTS** (`services/google_voice_client.text_to_speech`): uses Gemini's
   native (non-live) TTS model, `gemini-3.1-flash-tts-preview`. Speaks
   whatever language the answer text is in, which is the user's own.
-- **Latency**: a single ASR round-trip took ~17-20 seconds live (the
-  audio has to be sent at real-time pace, not just uploaded instantly -
-  see bug #7 above), and TTS took a few seconds. Both are "preview"-tier
-  Google models; expect this to improve as they mature, but budget for it
-  in a live demo.
+- **Latency**: ASR ~1.7s. Gemini TTS measured ~12s for a typical answer,
+  which is why `VOICE_TTS_PROVIDER` can route speech output to Bhashini
+  while ASR stays on Gemini.
 
-## Bhashini voice integration - built, but NOT verified live
+## Bhashini voice integration - verified live
+
+Tested against a real account: TTS ~0.5-1s (Hindi and English), ASR ~0.6-2s
+(Hindi). The recommended setup is `VOICE_PROVIDER=google` (Gemini ASR, which
+handles Hinglish and English) with `VOICE_TTS_PROVIDER=bhashini`. The live test
+found one bug, now fixed: ASR requests must not include a null `input` entry.
 
 The original build spec (Section 13) said to leave Bhashini as a
 swappable interface only, not implement it. Per an explicit later

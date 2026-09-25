@@ -35,6 +35,11 @@ from db.models import Base, CachedForecast  # noqa: E402
 from db.session import SessionLocal, engine  # noqa: E402
 from models.schemas import VerificationResult  # noqa: E402
 from services.llm_client import GenerationResult, LLMClient  # noqa: E402
+from config import settings as _settings  # noqa: E402
+
+# Can't be pinned via os.environ above (an empty value fails validation),
+# and a local .env setting it would send tests to a real TTS provider.
+_settings.voice_tts_provider = None
 
 SAMPLE_GEOCODE_RESPONSE = {
     "results": [{"name": "Mumbai", "latitude": 19.076, "longitude": 72.8777, "country": "India"}]
@@ -73,6 +78,19 @@ def _setup_db():
     engine.dispose()
     if TEST_DB_PATH.exists():
         TEST_DB_PATH.unlink()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sdk_clients():
+    """SDK clients are cached per process; tests that fake the SDK
+    constructor need each test to build its own."""
+    from services.llm_client import anthropic_sdk_client, genai_sdk_client
+
+    anthropic_sdk_client.cache_clear()
+    genai_sdk_client.cache_clear()
+    yield
+    anthropic_sdk_client.cache_clear()
+    genai_sdk_client.cache_clear()
 
 
 @pytest.fixture

@@ -40,6 +40,11 @@ export interface VoiceController {
 // Web Speech (BCP-47) locale, used only in web_speech mode.
 const WEB_SPEECH_LANG = 'en-IN';
 const MAX_RECORDING_MS = 15000;
+// Auto-stop: mic level (RMS) that counts as speech, level that counts as
+// silence, and how long a pause after speech ends the recording.
+const SPEECH_RMS = 0.02;
+const SILENCE_RMS = 0.01;
+const END_OF_SPEECH_MS = 900;
 
 const DEFAULT_CONFIG: VoiceConfig = { provider: 'web_speech', language: WEB_SPEECH_LANG };
 
@@ -219,8 +224,25 @@ function createServerVoiceController(config: VoiceConfig, handlers: VoiceHandler
       silentGain.gain.value = 0; // don't echo the mic straight back to the speakers
 
       const chunks: Float32Array[] = [];
+      let heardSpeech = false;
+      let silentMs = 0;
       processor.onaudioprocess = (event) => {
-        chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+        const samples = new Float32Array(event.inputBuffer.getChannelData(0));
+        chunks.push(samples);
+
+        // End the turn on a pause after speech, so the user doesn't have to
+        // click stop - waiting for the click was dead time on every query.
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+        const rms = Math.sqrt(sum / samples.length);
+        const blockMs = (samples.length / audioCtx.sampleRate) * 1000;
+        if (rms > SPEECH_RMS) {
+          heardSpeech = true;
+          silentMs = 0;
+        } else if (heardSpeech && rms < SILENCE_RMS) {
+          silentMs += blockMs;
+          if (silentMs >= END_OF_SPEECH_MS) queueMicrotask(stop);
+        }
       };
       source.connect(processor);
       processor.connect(silentGain);

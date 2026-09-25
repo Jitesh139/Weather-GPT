@@ -3,34 +3,14 @@ Bhashini alternative requested once Bhashini credentials turned out not to
 be available. Both directions authenticate with the same GEMINI_API_KEY
 already used by the LLM pipeline - no separate signup needed.
 
-ASR uses gemini-3.5-live-translate-preview (Gemini's Live API real-time
-audio-to-audio translation model). It returns both an input transcription
-(what the user actually said, in their own language) and an English
-translation; this module returns the INPUT transcription, so the user's
-language survives all the way to /query and the answer can come back in
-it. The English translation is kept only as a fallback for when the input
-transcription doesn't arrive.
+ASR is a single generate_content call with the audio inline
+(GOOGLE_ASR_MODEL). It returns what the user said in their own language, so
+the answer can come back in it. It replaced the Live translate model, which
+had to be fed audio at real-time pace and took ~20s for a 3s clip.
 
-That choice trades away one thing deliberately: a non-English transcript
-matches none of the router's English FAST patterns, so non-English
-questions always take the SLOW path. That is the right trade - the SLOW
-path is where the LLM is, and the LLM is what can answer in the user's
-language at all. The FAST path only has templates for the languages in
-services/language.py.
-
-TTS uses a separate, plain (non-live) Gemini text-to-speech model, since
-the translate model above is audio-in/audio-out only and can't synthesize
-speech from arbitrary text. It speaks whatever language the answer text is
-written in, which is now the user's own.
-
-Caveat: this integration is grounded in Google's own Live API and
-speech-generation documentation (ai.google.dev/gemini-api/docs/live-api,
-.../speech-generation), fetched live during this build, but - like the
-original Bhashini integration - has not been exercised against a live
-account with real audio in this environment beyond the one-shot testing
-covered by this project's test suite.
+TTS uses Gemini's text-to-speech model and speaks whatever language the
+answer text is written in.
 """
-import asyncio
 import audioop
 import base64
 import io
@@ -39,14 +19,11 @@ import wave
 from typing import Optional
 
 from config import settings
+from services.llm_client import genai_sdk_client
 
 logger = logging.getLogger(__name__)
 
 TARGET_SAMPLE_RATE = 16000
-_CHUNK_MS = 100
-_TRAILING_SILENCE_CHUNKS = 10  # 1s of silence so server-side VAD detects end-of-speech
-_RECEIVE_TIMEOUT_SECONDS = 30.0
-_MAX_RECEIVE_MESSAGES = 60  # safety cap - turn_complete is not reliably sent by this preview model
 _TTS_VOICE = "Kore"
 _TTS_OUTPUT_SAMPLE_RATE = 24000
 
@@ -61,11 +38,9 @@ class GoogleVoiceError(Exception):
 
 
 def _require_client():
-    from google import genai
-
     if not settings.gemini_api_key:
         raise GoogleVoiceConfigError("GEMINI_API_KEY is not set")
-    return genai.Client(api_key=settings.gemini_api_key)
+    return genai_sdk_client(settings.gemini_api_key)
 
 
 def _wav_to_pcm16_mono(audio_bytes: bytes) -> tuple[bytes, int]:
@@ -92,84 +67,28 @@ def _resample_to_target(pcm: bytes, frame_rate: int) -> bytes:
     return converted
 
 
-async def _transcribe_async(client, pcm16_16k: bytes) -> str:
-    """Live-tested finding: this model does not reliably send turn_complete
-    for a pre-recorded (not truly live-mic) clip, and sending the whole
-    clip in one instantaneous burst causes the server to only partially
-    transcribe it. Two adjustments, confirmed against the real API, fix
-    this: (1) pace the send to real-time (matching each chunk's actual
-    duration) with trailing silence so server-side voice-activity
-    detection can find the end of speech, and (2) don't gate completion
-    on turn_complete - cap the receive loop by message count instead, run
-    concurrently with the sender via asyncio.gather.
-    """
-    from google.genai import types
+_ASR_PROMPT = (
+    "Transcribe this audio verbatim, in the language and script it was spoken in "
+    "(Hindi in Devanagari, Hinglish in Latin script, English as English). "
+    "Output only the transcript, nothing else."
+)
 
-    config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        translation_config=types.TranslationConfig(target_language_code="en", echo_target_language=True),
-    )
 
-    chunk_bytes = int(TARGET_SAMPLE_RATE * 2 * (_CHUNK_MS / 1000))
-    chunk_seconds = _CHUNK_MS / 1000
-    output_parts: list[str] = []
-    input_parts: list[str] = []
-
-    async with client.aio.live.connect(model=settings.google_translate_model, config=config) as session:
-
-        async def sender() -> None:
-            for i in range(0, len(pcm16_16k), chunk_bytes):
-                chunk = pcm16_16k[i : i + chunk_bytes]
-                await session.send_realtime_input(audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000"))
-                await asyncio.sleep(chunk_seconds)
-            silence = b"\x00\x00" * (TARGET_SAMPLE_RATE // 10)
-            for _ in range(_TRAILING_SILENCE_CHUNKS):
-                await session.send_realtime_input(audio=types.Blob(data=silence, mime_type="audio/pcm;rate=16000"))
-                await asyncio.sleep(chunk_seconds)
-            await session.send_realtime_input(audio_stream_end=True)
-
-        async def receiver() -> None:
-            count = 0
-            async for response in session.receive():
-                count += 1
-                server_content = getattr(response, "server_content", None)
-                if server_content is not None:
-                    input_transcription = getattr(server_content, "input_transcription", None)
-                    if input_transcription is not None and input_transcription.text:
-                        input_parts.append(input_transcription.text)
-                    output_transcription = getattr(server_content, "output_transcription", None)
-                    if output_transcription is not None and output_transcription.text:
-                        output_parts.append(output_transcription.text)
-                    if getattr(server_content, "turn_complete", False):
-                        break
-                if count >= _MAX_RECEIVE_MESSAGES:
-                    break
-
-        try:
-            await asyncio.wait_for(asyncio.gather(sender(), receiver()), timeout=_RECEIVE_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError as exc:
-            raise GoogleVoiceError("Timed out waiting for Gemini transcription") from exc
-
-    # The INPUT transcription is preferred: it is what the user actually
-    # said, in the language they said it in, which is what makes a
-    # multilingual answer possible at all. This used to return the English
-    # translation instead, so a question asked in Hindi reached /query
-    # already translated and came back answered in English - the language
-    # was destroyed before any other component could see it.
-    #
-    # The translation is kept as the fallback for when the input
-    # transcription doesn't arrive. Routing is unaffected: a non-English
-    # transcript matches none of the router's English FAST patterns, so it
-    # defaults to the SLOW path, where the generator handles the language.
-    return "".join(input_parts).strip() or "".join(output_parts).strip()
+def _pcm_to_wav(pcm16_mono: bytes, frame_rate: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(frame_rate)
+        wf.writeframes(pcm16_mono)
+    return buffer.getvalue()
 
 
 def speech_to_text(audio_base64: str, sampling_rate: int = 16000) -> str:
-    """Returns an English transcript/translation for the given base64-
-    encoded WAV audio (any sample rate - resampled to 16kHz here, which is
-    what the Live API requires)."""
+    """Returns the transcript of the given base64-encoded WAV audio, in the
+    language it was spoken in, so the answer can come back in that language."""
+    from google.genai import types
+
     client = _require_client()
 
     try:
@@ -178,14 +97,19 @@ def speech_to_text(audio_base64: str, sampling_rate: int = 16000) -> str:
         raise GoogleVoiceError(f"Could not decode base64 audio: {exc}") from exc
 
     pcm, frame_rate = _wav_to_pcm16_mono(audio_bytes)
-    pcm16_16k = _resample_to_target(pcm, frame_rate)
+    # Browsers record at 44.1/48kHz; 16kHz mono is all speech needs and
+    # cuts the upload to a third.
+    wav_16k = _pcm_to_wav(_resample_to_target(pcm, frame_rate), TARGET_SAMPLE_RATE)
 
     try:
-        transcript = asyncio.run(_transcribe_async(client, pcm16_16k))
-    except GoogleVoiceError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - any SDK/session error is a real ASR failure
-        raise GoogleVoiceError(f"Gemini live transcription failed: {exc}") from exc
+        response = client.models.generate_content(
+            model=settings.google_asr_model,
+            contents=[types.Part.from_bytes(data=wav_16k, mime_type="audio/wav"), _ASR_PROMPT],
+            config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_level="minimal")),
+        )
+        transcript = (response.text or "").strip()
+    except Exception as exc:  # noqa: BLE001 - any SDK error is a real ASR failure
+        raise GoogleVoiceError(f"Gemini transcription failed: {exc}") from exc
 
     if not transcript:
         raise GoogleVoiceError("Gemini returned an empty transcript")

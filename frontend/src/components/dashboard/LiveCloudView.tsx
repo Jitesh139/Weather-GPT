@@ -296,10 +296,12 @@ interface PooledFrame {
   ok: number;
 }
 
-/** One entry on the shared timeline: an ICON forecast hour. */
+/** One entry on the shared timeline: a 10-minute cloud frame in the past, or
+ *  an ICON forecast hour in the future. */
 interface TimelineStep {
   at: Date;
-  /** Index into latest.json's valid_times, needed for time_step=valid_times_N. */
+  /** Index into latest.json's valid_times, needed for time_step=valid_times_N;
+   *  -1 when no ICON hour is within half an hour of this step. */
   iconIndex: number;
   /** Nearest cloud frame, or -1 when the hour is past the newest imagery. */
   cloudIndex: number;
@@ -365,9 +367,35 @@ export function LiveCloudView() {
   const [showTrueColor, setShowTrueColor] = useState(false);
 
   const frames = useMemo(() => buildFrames(), []);
-  const [steps, setSteps] = useState<TimelineStep[]>([]);
-  const [stepIndex, setStepIndex] = useState(0);
+  const [iconTimes, setIconTimes] = useState<string[] | null>(null);
+  // Start on the newest cloud frame so imagery is visible on first paint.
+  const [stepIndex, setStepIndex] = useState(GEO_FRAMES - 1);
   const [timelineError, setTimelineError] = useState(false);
+
+  // Every cloud frame is a step, so playback animates at the imagery's native
+  // 10-minute cadence; ICON hours past the newest frame follow for wind only.
+  const steps = useMemo<TimelineStep[]>(() => {
+    const icon = (iconTimes ?? []).map((iso) => new Date(iso).getTime());
+    const nearestIcon = (ms: number) => {
+      let best = -1;
+      let gap = Infinity;
+      icon.forEach((t, i) => {
+        const g = Math.abs(t - ms);
+        if (g < gap) {
+          gap = g;
+          best = i;
+        }
+      });
+      return gap <= 30 * 60_000 ? best : -1;
+    };
+    const past = frames.map((f, i) => ({ at: f.at, cloudIndex: i, iconIndex: nearestIcon(f.at.getTime()) }));
+    const last = frames[frames.length - 1].at.getTime();
+    const until = Date.now() + FORECAST_HOURS * 3600_000;
+    const future = icon.flatMap((ms, iconIndex) =>
+      ms > last && ms <= until ? [{ at: new Date(ms), iconIndex, cloudIndex: -1 }] : [],
+    );
+    return [...past, ...future];
+  }, [frames, iconTimes]);
 
   const [shown, setShown] = useState(-1);
   const [playing, setPlaying] = useState(false);
@@ -403,39 +431,11 @@ export function LiveCloudView() {
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then((body: { valid_times?: string[] }) => {
         if (cancelled) return;
-        const times = body.valid_times ?? [];
-        const newest = newestCloudTime();
-        const from = Date.now() - GEO_FRAMES * STEP_MINUTES * 60_000;
-        const until = Date.now() + FORECAST_HOURS * 3600_000;
-        const stepMs = STEP_MINUTES * 60_000;
-
-        const built: TimelineStep[] = [];
-        times.forEach((iso, iconIndex) => {
-          const at = new Date(iso);
-          const ms = at.getTime();
-          if (ms < from || ms > until) return;
-          // Snap to the nearest cloud frame; -1 once the hour runs past the
-          // newest imagery GIBS holds.
-          const offset = Math.round((ms - frames[0].at.getTime()) / stepMs);
-          const cloudIdx = ms <= newest + stepMs && offset >= 0 && offset < frames.length ? offset : -1;
-          built.push({ at, iconIndex, cloudIndex: cloudIdx });
-        });
-        if (!built.length) {
+        if (!body.valid_times?.length) {
           setTimelineError(true);
           return;
         }
-        // Start on the hour closest to now.
-        let start = 0;
-        let bestGap = Infinity;
-        built.forEach((s, i) => {
-          const gap = Math.abs(s.at.getTime() - Date.now());
-          if (gap < bestGap) {
-            bestGap = gap;
-            start = i;
-          }
-        });
-        setSteps(built);
-        setStepIndex(start);
+        setIconTimes(body.valid_times);
       })
       .catch(() => {
         if (!cancelled) setTimelineError(true);
@@ -444,7 +444,7 @@ export function LiveCloudView() {
       cancelled = true;
       controller.abort();
     };
-  }, [frames]);
+  }, []);
 
   // --- map bootstrap: base imagery only -------------------------------
   useEffect(() => {
@@ -540,12 +540,13 @@ export function LiveCloudView() {
   }, [map, showTrueColor, trueColorDate]);
 
   // --- wind field ------------------------------------------------------
+  const iconIndex = step ? step.iconIndex : -1;
   useEffect(() => {
-    if (!map || !showWind || !step) return;
+    if (!map || !showWind || iconIndex < 0) return;
     let layer: L.Layer | null = null;
     try {
       const adapter = getOmAdapter();
-      layer = adapter.createTileLayer(windUrl(step.iconIndex), {
+      layer = adapter.createTileLayer(windUrl(iconIndex), {
         opacity: windOpacity,
         zIndex: 3,
         pane: 'tilePane',
@@ -557,7 +558,7 @@ export function LiveCloudView() {
     return () => {
       if (layer) map.removeLayer(layer);
     };
-  }, [map, showWind, step, windOpacity]);
+  }, [map, showWind, iconIndex, windOpacity]);
 
   // --- pause playback while the user is manipulating the map ---------
   useEffect(() => {
@@ -758,8 +759,7 @@ export function LiveCloudView() {
     // map in the connection queue, which is what made the first paint blank.
     if (poolRef.current.get(cloudIndex)?.status !== 'loading') {
       for (let k = 1; k <= PRELOAD_AHEAD; k++) {
-        const i = cloudIndex + k;
-        if (i >= frames.length) break;
+        const i = (cloudIndex + k) % frames.length;
         keep.add(i);
         ensureFrame(i);
       }
@@ -810,14 +810,17 @@ export function LiveCloudView() {
   // --- playback -------------------------------------------------------
   useEffect(() => {
     if (!playing || interacting || steps.length === 0) return;
+    // With clouds on, loop the imagery rather than running on into forecast
+    // hours where there are no clouds to animate.
+    const loopEnd = showClouds ? frames.length : steps.length;
     const timer = window.setInterval(() => {
       // Only advance once the current cloud frame is on screen, so a slow
       // frame stretches the animation instead of dropping it.
       if (cloudIndex >= 0 && poolRef.current.get(cloudIndex)?.status === 'loading') return;
-      setStepIndex((prev) => (prev + 1) % steps.length);
+      setStepIndex((prev) => (prev + 1 >= loopEnd ? 0 : prev + 1));
     }, PLAYBACK_MS);
     return () => window.clearInterval(timer);
-  }, [playing, interacting, steps.length, cloudIndex]);
+  }, [playing, interacting, steps.length, frames.length, showClouds, cloudIndex]);
 
   // --- city pins ------------------------------------------------------
   useEffect(() => {
@@ -874,9 +877,9 @@ export function LiveCloudView() {
           Live Cloud View
         </h2>
         <p className="mt-1 font-sans text-sm text-textMuted">
-          NASA GIBS imagery with the DWD ICON wind field on one map. The timeline runs hourly from the last{' '}
-          {(GEO_FRAMES * STEP_MINUTES) / 60} hours to {FORECAST_HOURS} hours ahead. Hover the map for the wind
-          speed at that point.
+          NASA GIBS imagery with the DWD ICON wind field on one map. The timeline steps through the last{' '}
+          {(GEO_FRAMES * STEP_MINUTES) / 60} hours of satellite frames every {STEP_MINUTES} minutes, then the wind
+          forecast hourly to {FORECAST_HOURS} hours ahead. Hover the map for the wind speed at that point.
         </p>
       </header>
 
@@ -988,7 +991,7 @@ export function LiveCloudView() {
             {(unavailable || timelineError) && (
               <div className="pointer-events-none absolute top-3 left-3 z-[400] flex items-center gap-2 rounded-lg border border-alertRed/40 bg-black/75 px-3 py-2 font-mono text-[11px] text-alertRed backdrop-blur-sm">
                 <AlertCircle className="h-3.5 w-3.5" />
-                {timelineError ? 'Forecast timeline unavailable' : 'Satellite imagery temporarily unavailable'}
+                {timelineError ? 'Wind forecast unavailable' : 'Satellite imagery temporarily unavailable'}
               </div>
             )}
 

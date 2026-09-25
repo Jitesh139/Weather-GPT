@@ -2,7 +2,7 @@
 client/session is faked out (mirroring how test_llm_client_gemini.py fakes
 the google-genai SDK) so the suite stays offline - only the WAV encode/
 decode/resample helpers and this module's own orchestration are under
-test here, not Gemini's actual Live API behavior.
+test here, not Gemini's actual behavior.
 """
 import base64
 import io
@@ -73,112 +73,47 @@ def test_speech_to_text_raises_on_non_wav_audio(monkeypatch):
 
 
 # ---------------------------------------------------------------------
-# ASR happy/failure paths (fake Live API session)
+# ASR happy/failure paths (fake one-shot generate_content)
 # ---------------------------------------------------------------------
 
 
-class _FakeTranscription:
+class _FakeASRResponse:
     def __init__(self, text):
         self.text = text
 
 
-class _FakeServerContent:
-    def __init__(self, text, complete, spoken_text=None):
-        self.output_transcription = _FakeTranscription(text)
-        # What the user actually said, in their own language. None here
-        # means the model only sent back the translation.
-        self.input_transcription = _FakeTranscription(spoken_text) if spoken_text else None
-        self.turn_complete = complete
+class _FakeASRModels:
+    def __init__(self, text):
+        self._text = text
+        self.calls = []
+
+    def generate_content(self, model, contents, config=None):
+        self.calls.append({"model": model, "contents": contents})
+        return _FakeASRResponse(self._text)
 
 
-class _FakeLiveResponse:
-    def __init__(self, text, complete, spoken_text=None):
-        self.server_content = _FakeServerContent(text, complete, spoken_text)
-
-
-class _FakeLiveSession:
-    def __init__(self, transcript_text, spoken_text=None):
-        self._transcript_text = transcript_text
-        self._spoken_text = spoken_text
-        self.sent_chunks = []
-        self.stream_ended = False
-
-    async def send_realtime_input(self, audio=None, audio_stream_end=None):
-        if audio is not None:
-            self.sent_chunks.append(audio)
-        if audio_stream_end:
-            self.stream_ended = True
-
-    async def receive(self):
-        yield _FakeLiveResponse(self._transcript_text, True, self._spoken_text)
-
-
-class _FakeLiveConnectCM:
-    def __init__(self, session):
-        self._session = session
-
-    async def __aenter__(self):
-        return self._session
-
-    async def __aexit__(self, *args):
-        return False
-
-
-class _FakeLive:
-    def __init__(self, session):
-        self._session = session
-
-    def connect(self, model, config):
-        return _FakeLiveConnectCM(self._session)
-
-
-class _FakeAio:
-    def __init__(self, session):
-        self.live = _FakeLive(session)
-
-
-class _FakeGeminiClient:
-    def __init__(self, session):
-        self.aio = _FakeAio(session)
+class _FakeASRClient:
+    def __init__(self, text):
+        self.models = _FakeASRModels(text)
 
 
 def test_speech_to_text_happy_path(monkeypatch):
-    fake_session = _FakeLiveSession("hello there")
-    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
+    fake = _FakeASRClient("  aaj ka mausam kaisa hai \n")
+    monkeypatch.setattr(google_voice_client, "_require_client", lambda: fake)
 
-    transcript = google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())
-
-    assert transcript == "hello there"
-    assert fake_session.stream_ended
-    assert len(fake_session.sent_chunks) > 0
-
-
-def test_speech_to_text_returns_what_was_actually_said_not_the_translation(monkeypatch):
-    """Multilingual answers depend on this. The Live model returns both an
-    input transcription (the user's own words) and an English translation;
-    returning the translation threw away the language before /query could
-    detect it, so a Hindi question always came back answered in English.
-    """
-    fake_session = _FakeLiveSession("How is the weather today?", spoken_text="aaj ka mausam kaisa hai")
-    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
-
-    transcript = google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())
+    wav_48k = _make_wav_bytes(frame_rate=48000, num_samples=4800)
+    transcript = google_voice_client.speech_to_text(base64.b64encode(wav_48k).decode())
 
     assert transcript == "aaj ka mausam kaisa hai"
+    assert len(fake.models.calls) == 1
+    audio_part = fake.models.calls[0]["contents"][0]
+    with wave.open(io.BytesIO(audio_part.inline_data.data), "rb") as wf:
+        assert wf.getframerate() == 16000  # downsampled before upload
 
 
-def test_speech_to_text_falls_back_to_translation_when_no_input_transcription(monkeypatch):
-    fake_session = _FakeLiveSession("How is the weather today?", spoken_text=None)
-    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
-
-    transcript = google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())
-
-    assert transcript == "How is the weather today?"
-
-
-def test_speech_to_text_empty_transcript_raises(monkeypatch):
-    fake_session = _FakeLiveSession("")
-    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeGeminiClient(fake_session))
+@pytest.mark.parametrize("text", ["", None])
+def test_speech_to_text_empty_transcript_raises(monkeypatch, text):
+    monkeypatch.setattr(google_voice_client, "_require_client", lambda: _FakeASRClient(text))
 
     with pytest.raises(GoogleVoiceError):
         google_voice_client.speech_to_text(base64.b64encode(_make_wav_bytes()).decode())

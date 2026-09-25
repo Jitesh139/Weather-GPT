@@ -8,6 +8,7 @@ Claude=generator, Gemini=verifier. This is a reasonable default, not a
 locked-in decision - swap it via GENERATOR_PROVIDER/VERIFIER_PROVIDER in
 .env without touching any pipeline code.
 """
+import functools
 import json
 import logging
 import re
@@ -55,6 +56,23 @@ class LLMUngroundedClaimError(Exception):
 
 ToolExecutor = Callable[[str, dict[str, Any]], dict[str, Any]]
 
+
+# SDK clients are reused for the life of the process so their HTTP
+# connections stay warm - a new client per request paid a fresh TLS
+# handshake on every model call.
+@functools.cache
+def anthropic_sdk_client(api_key: str):
+    import anthropic
+
+    return anthropic.Anthropic(api_key=api_key)
+
+
+@functools.cache
+def genai_sdk_client(api_key: str):
+    from google import genai
+
+    return genai.Client(api_key=api_key)
+
 # Deliberately generous. On Claude Opus 5 (the configured verifier)
 # adaptive thinking is on by default and its tokens count against
 # max_tokens, so a tight cap gets spent on reasoning and truncates the
@@ -69,6 +87,11 @@ _ANTHROPIC_MAX_TOKENS = 16000
 # site for why this is low rather than the default. Override per
 # deployment if you'd rather trade latency back for scrutiny.
 _VERIFIER_EFFORT = "low"
+
+# Gemini thinks by default. The generator only picks a tool argument and
+# rephrases the tool result, so default thinking was pure latency: measured
+# ~5s per answer against ~3.5s at "minimal".
+_GEMINI_THINKING_LEVEL = "minimal"
 
 _VERIFY_SCHEMA = {
     "type": "object",
@@ -131,11 +154,9 @@ class AnthropicClient(LLMClient):
         self.model = model
 
     def _client(self):
-        import anthropic
-
         if not self.api_key:
             raise LLMConfigError("ANTHROPIC_API_KEY is not set")
-        return anthropic.Anthropic(api_key=self.api_key)
+        return anthropic_sdk_client(self.api_key)
 
     def generate_with_tools(
         self,
@@ -213,6 +234,10 @@ class AnthropicClient(LLMClient):
             model=self.model,
             max_tokens=_ANTHROPIC_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
+            # No thinking: the schema-constrained JSON verdict needs none,
+            # and it cut Sonnet 5 from ~4s to ~2-3s. Safe here because this
+            # call has no tools and structured output fixes the reply shape.
+            thinking={"type": "disabled"},
             output_config={
                 "format": {"type": "json_schema", "schema": _VERIFY_SCHEMA},
                 # Low effort, deliberately. By the time this runs, every
@@ -251,11 +276,9 @@ class GeminiClient(LLMClient):
         self.model = model
 
     def _client(self):
-        from google import genai
-
         if not self.api_key:
             raise LLMConfigError("GEMINI_API_KEY is not set")
-        return genai.Client(api_key=self.api_key)
+        return genai_sdk_client(self.api_key)
 
     def generate_with_tools(
         self,
@@ -281,7 +304,11 @@ class GeminiClient(LLMClient):
             response = client.models.generate_content(
                 model=self.model,
                 contents=contents,
-                config=types.GenerateContentConfig(system_instruction=system_prompt, tools=[gemini_tool]),
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=[gemini_tool],
+                    thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
+                ),
             )
             candidate = response.candidates[0]
             parts = candidate.content.parts or []
@@ -328,6 +355,7 @@ class GeminiClient(LLMClient):
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=_VERIFY_SCHEMA_GEMINI,
+                thinking_config=types.ThinkingConfig(thinking_level=_GEMINI_THINKING_LEVEL),
             ),
         )
         # response.text is None when the candidate was truncated or blocked;

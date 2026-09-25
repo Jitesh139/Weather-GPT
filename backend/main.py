@@ -142,12 +142,14 @@ def voice_tts(request: TTSRequest) -> TTSResponse:
     browser and never calls this endpoint.
     """
     try:
-        if settings.voice_provider == "google":
+        if (settings.voice_tts_provider or settings.voice_provider) == "google":
             audio_base64 = google_voice_client.text_to_speech(request.text)
         else:
+            # Voice the answer in the language it was written in, which
+            # follows the question's language, not the configured default.
             audio_base64 = bhashini_client.text_to_speech(
                 request.text,
-                request.language or settings.bhashini_language,
+                lang.detect_language(request.text),
                 request.gender or settings.bhashini_tts_gender,
             )
         return TTSResponse(audio_base64=audio_base64)

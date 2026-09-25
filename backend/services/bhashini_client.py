@@ -1,12 +1,9 @@
 """Bhashini ASR/TTS integration (spec Section 7's swappable voice-layer
 interface, now implemented for real per explicit user request - this
 goes beyond the original build spec's Section 13, which said to leave
-Bhashini as an interface only. Flagged clearly: this has NOT been
-exercised against a real Bhashini account in this build (no credentials
-were available) - the request/response shapes below come directly from
-Bhashini's own API documentation (bhashini.gitbook.io/bhashini-apis),
-not from a live test. Verify end-to-end once BHASHINI_USER_ID and
-BHASHINI_API_KEY are set.
+Bhashini as an interface only. Verified against a live account: TTS
+(hi, en) ~0.5-1s, ASR (hi) ~0.6-2s. TTS returns 32-bit float WAV at
+22.05kHz.
 
 Bhashini's inference flow is two calls:
   1. Pipeline Config Call - fixed endpoint, authenticated with
@@ -27,6 +24,10 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+# One pooled client for the process: reusing the TLS connection cut each
+# call from ~1.1s to ~0.2s against a fresh connection per request.
+_http = httpx.Client(timeout=30.0)
 
 CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 
@@ -65,7 +66,7 @@ def _raise_for_transient(exc: httpx.HTTPStatusError) -> None:
 )
 def _post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
     try:
-        response = httpx.post(url, headers=headers, json=body, timeout=30.0)
+        response = _http.post(url, headers=headers, json=body)
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as exc:
@@ -140,7 +141,8 @@ def speech_to_text(audio_base64: str, source_language: str, audio_format: str = 
                 },
             }
         ],
-        "inputData": {"input": [{"source": None}], "audio": [{"audioContent": audio_base64}]},
+        # Audio only - the live API rejects an "input" entry with a null source (422).
+        "inputData": {"audio": [{"audioContent": audio_base64}]},
     }
     headers = {
         pipeline["auth_header_name"]: pipeline["auth_header_value"],

@@ -34,16 +34,11 @@ class Settings(BaseSettings):
     # its own - this is never a hard dependency.
     google_weather_api_key: Optional[str] = None
 
-    # Model used for voice ASR when VOICE_PROVIDER=google - a Gemini Live
-    # API model that does real-time audio-to-audio translation. Used here
-    # purely for its speech-to-text side, configured to translate into
-    # English so the query router (which matches English keywords) always
-    # gets a usable transcript regardless of what language was spoken.
-    google_translate_model: str = "gemini-3.5-live-translate-preview"
-    # Model used for voice TTS when VOICE_PROVIDER=google - Gemini's native
-    # (non-live) text-to-speech model. Always speaks the answer in
-    # English, since the translate model above is audio-in/audio-out only
-    # and can't synthesize speech from arbitrary text - see README.
+    # Model used for voice ASR when VOICE_PROVIDER=google - one-shot audio
+    # transcription. Measured ~1.7s for a short clip, against ~20s for the
+    # Live translate model this replaced (which streams at real-time pace).
+    google_asr_model: str = "gemini-3.5-flash-lite"
+    # Model used for voice TTS when the TTS provider is google.
     google_tts_model: str = "gemini-3.1-flash-tts-preview"
 
     database_url: str = "postgresql://weathergpt:weathergpt@localhost:5432/weathergpt"
@@ -67,6 +62,9 @@ class Settings(BaseSettings):
     # must never hold these, so Bhashini calls happen via backend
     # endpoints, unlike Web Speech which is fully client-side).
     voice_provider: Literal["web_speech", "bhashini", "google"] = "web_speech"
+    # Lets speech output use a different server-side provider from speech
+    # input (e.g. Gemini ASR + Bhashini TTS). Unset = same as VOICE_PROVIDER.
+    voice_tts_provider: Optional[Literal["bhashini", "google"]] = None
     bhashini_user_id: Optional[str] = None
     bhashini_api_key: Optional[str] = None
     # Default pipeline ID for the standard ASR+TTS pipeline, as commonly
