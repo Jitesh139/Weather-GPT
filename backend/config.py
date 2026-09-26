@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Literal, Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,13 @@ class Settings(BaseSettings):
     google_tts_model: str = "gemini-3.1-flash-tts-preview"
 
     database_url: str = "postgresql://weathergpt:weathergpt@localhost:5432/weathergpt"
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def assemble_db_connection(cls, v: str) -> str:
+        if isinstance(v, str) and v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql://", 1)
+        return v
 
     cache_ttl_seconds: int = 900
     log_level: str = "info"

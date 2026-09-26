@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: weathergpt-backend
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: weathergpt-db
+          property: connectionString
+      - key: LOG_LEVEL
+        value: info
+      - key: CACHE_TTL_SECONDS
+        value: "900"
+      - key: GENERATOR_PROVIDER
+        value: gemini
+      - key: VERIFIER_PROVIDER
+        value: claude
+      - key: GENERATOR_MODEL
+        value: gemini-3.5-flash-lite
+      - key: VERIFIER_MODEL
+        value: claude-sonnet-5
+      - key: VOICE_PROVIDER
+        value: google
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_WEATHER_API_KEY
+        sync: false
+
+databases:
+  - name: weathergpt-db
+    databaseName: weathergpt
+    user: weathergpt
+    plan: free
