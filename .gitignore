@@ -1,13 +1,45 @@
+# Environment & secrets
 .env
+.env.*
+!.env.example
+*.env
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
 .venv/
 venv/
+env/
+ENV/
+
+# Database & local data
+*.db
+*.sqlite3
 pgdata/
+
+# Testing & cache
 .pytest_cache/
-*.egg-info/
+.coverage
+htmlcov/
+
+# Logs & temp files
+*.log
+*.log.*
+*.pid
+run.pid.txt
+
+# Node / Frontend
+frontend/node_modules/
+node_modules/
+frontend/dist/
+dist/
+.npm
+.vite
+
+# OS & IDE
 .vscode/
 .idea/
-*.db
-*.log
-run.pid.txt
+.DS_Store
+Thumbs.db

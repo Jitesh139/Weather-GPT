@@ -228,8 +228,8 @@ function ensureFadeStyle() {
 let omAdapter: ReturnType<typeof addLeafletProtocolSupport> | null = null;
 function getOmAdapter() {
   if (!omAdapter) {
-    omAdapter = addLeafletProtocolSupport(L);
-    omAdapter.addProtocol('om', omProtocol);
+    omAdapter = addLeafletProtocolSupport(L as any);
+    omAdapter.addProtocol('om', omProtocol as any);
   }
   return omAdapter;
 }
@@ -326,13 +326,15 @@ function WindLegend() {
     }
   }, []);
 
-  if (!scale?.breakpoints?.length || !scale.colors?.length) return null;
+  const s = scale as { breakpoints?: number[]; colors?: number[][] } | null;
+  if (!s?.breakpoints?.length || !s.colors?.length) return null;
 
-  const stops = scale.breakpoints;
+  const stops = s.breakpoints;
   const span = stops[stops.length - 1] - stops[0] || 1;
+  const colors = s.colors;
   const gradient = stops
-    .map((bp, i) => {
-      const c = scale.colors[Math.min(i, scale.colors.length - 1)];
+    .map((bp: number, i: number) => {
+      const c = colors[Math.min(i, colors.length - 1)];
       const pct = ((bp - stops[0]) / span) * 100;
       return `rgba(${c[0]},${c[1]},${c[2]},${c[3]}) ${pct.toFixed(1)}%`;
     })
