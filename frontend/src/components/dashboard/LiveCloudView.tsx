@@ -44,7 +44,7 @@ import {
  *   1. VIIRS_SNPP_CorrectedReflectance_TrueColor - optional daily true color
  *   2. Himawari_AHI_Band13_Clean_Infrared - animated clouds
  *   3. DWD ICON wind_speed_10m - Open-Meteo om:// layer
- *   4. Coastlines_15m + Reference_Features_15m - static reference
+ *   4. Coastlines_15m - static reference
  */
 
 // GIBS speaks HTTP/1.1, so a browser opens at most 6 connections per origin.
@@ -118,18 +118,17 @@ const COASTLINES_LAYER: GibsLayerConfig = {
   ext: 'png',
   maxNativeZoom: 13,
 };
-const BORDERS_LAYER: GibsLayerConfig = {
-  layer: 'Reference_Features_15m',
-  matrixSet: 'GoogleMapsCompatible_Level13',
-  ext: 'png',
-  maxNativeZoom: 13,
-};
-// Reference_Labels_15m is deliberately absent. Over India it serves no label
+// Reference_Labels_15m and Reference_Features_15m are deliberately absent.
+// Reference_Features_15m has the same fault: over Indian land its tiles are
+// the 921-byte all-black variant (3 of 5 sampled at z4/z5, Oct 2026), which
+// showed up as black boxes over the map.
+//
+// Reference_Labels_15m Over India it serves no label
 // content at all, and GIBS encodes its empty tiles two different ways: a
 // correct transparent PNG, and a 921-byte palette PNG that is 100% opaque
 // black. At the zooms this map uses most tiles come back as the black variant
 // (11 of 16 sampled at z5/z6), so the layer only ever painted black boxes over
-// the imagery. Coastlines and borders carry the readability instead.
+// the imagery. Coastlines carry the readability instead.
 
 const STEP_MINUTES = 10;
 const GEO_FRAMES = 36; // 6 hours of cloud frames
@@ -171,8 +170,11 @@ function buildFrames(): Frame[] {
   return out;
 }
 
-function yesterdayUTC(): string {
-  return new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+function trueColorDateUTC(): string {
+  // Go back 2 days instead of 1. A 1-day offset often hits an incomplete
+  // composite where the trailing edge of the satellite passes is missing data,
+  // which GIBS renders as opaque black JPEG pixels that cover the base map.
+  return new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
 }
 
 function staticUrl(cfg: GibsLayerConfig, time?: string): string {
@@ -241,16 +243,23 @@ function getOmAdapter() {
  *  The real URL has to be rebuilt from the tile coordinates. This is also
  *  what absorbs GIBS's occasional one-off 500s so they never surface as
  *  visible error artwork. */
-function retryTileOnce(layer: L.TileLayer, event: L.TileErrorEvent) {
+function retryTile(layer: L.TileLayer, event: L.TileErrorEvent) {
   const img = event.tile as HTMLImageElement | undefined;
-  if (!img || img.dataset.retried === '1') return;
-  img.dataset.retried = '1';
+  if (!img) return;
+  
+  const attempts = parseInt(img.dataset.retries || '0', 10);
+  if (attempts >= 5) return; // Give up after 5 retries so it falls back to BLANK_TILE
+  img.dataset.retries = (attempts + 1).toString();
+
   const url = (layer as unknown as { getTileUrl(coords: L.Coords): string }).getTileUrl(event.coords);
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s to respect GIBS rate limits
+  const delay = TILE_RETRY_MS * Math.pow(2, attempts);
+  
   window.setTimeout(() => {
     if (!img.isConnected) return;
     delete img.dataset.gibsFailed;
     img.src = url;
-  }, TILE_RETRY_MS);
+  }, delay);
 }
 
 function makeStaticLayer(
@@ -273,7 +282,7 @@ function makeStaticLayer(
     zIndex: opts.zIndex,
     attribution: opts.attribution,
   });
-  layer.on('tileerror', (event: L.TileErrorEvent) => retryTileOnce(layer, event));
+  layer.on('tileerror', (event: L.TileErrorEvent) => retryTile(layer, event));
   return layer;
 }
 
@@ -410,7 +419,7 @@ export function LiveCloudView() {
   const [cityError, setCityError] = useState<string | null>(null);
   const [cursor, setCursor] = useState<CursorState | null>(null);
 
-  const trueColorDate = useMemo(() => yesterdayUTC(), []);
+  const trueColorDate = useMemo(() => trueColorDateUTC(), []);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [map, setMap] = useState<L.Map | null>(null);
@@ -518,16 +527,13 @@ export function LiveCloudView() {
     };
   }, []);
 
-  // --- coastlines + borders, once the base imagery is in --------------
+  // --- coastlines, once the base imagery is in --------------
   useEffect(() => {
     if (!map || !baseReady) return;
     const coastlines = makeStaticLayer(COASTLINES_LAYER, { zIndex: 4 });
-    const borders = makeStaticLayer(BORDERS_LAYER, { zIndex: 5 });
     coastlines.addTo(map);
-    borders.addTo(map);
     return () => {
       map.removeLayer(coastlines);
-      map.removeLayer(borders);
     };
   }, [map, baseReady]);
 
@@ -725,7 +731,7 @@ export function LiveCloudView() {
       layer.on('tileerror', (event: L.TileErrorEvent) => {
         const img = event.tile as HTMLImageElement | undefined;
         if (img) img.dataset.gibsFailed = '1';
-        retryTileOnce(layer, event);
+        retryTile(layer, event);
       });
       layer.on('tileload', (event: L.TileEvent) => {
         const img = event.tile as HTMLImageElement | undefined;
